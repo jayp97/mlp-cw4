@@ -1,0 +1,11 @@
+numpy
+pandas
+matplotlib
+scikit-learn
+torch
+torchvision
+tqdm
+efficientnet_pytorch
+diffusers
+transformers
+albumentations
