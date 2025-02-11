@@ -1,5 +1,5 @@
 # Ignore dataset and large files
-data/
+data/*
 !data/README.md  # Allow a README inside data to explain the dataset
 
 # Ignore Python bytecode files
