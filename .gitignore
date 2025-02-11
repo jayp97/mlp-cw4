@@ -1,0 +1,74 @@
+# Ignore dataset and large files
+data/
+!data/README.md  # Allow a README inside data to explain the dataset
+
+# Ignore Python bytecode files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore virtual environment
+venv/
+.env/
+*.venv/
+
+# Ignore compiled libraries
+*.so
+*.dylib
+*.dll
+
+# Ignore log and temp files
+logs/
+*.log
+*.out
+*.tmp
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore results and outputs
+results/
+*.csv
+*.json
+*.h5
+*.ckpt
+*.pth
+*.pt
+*.tflite
+
+# Ignore model checkpoints
+checkpoints/
+models/
+*.onnx
+*.pb
+*.pkl
+
+# Ignore experiment tracking files (e.g., MLflow, TensorBoard)
+mlruns/
+tensorboard_logs/
+
+# Ignore VS Code and PyCharm settings
+.vscode/
+.idea/
+
+# Ignore files related to package management
+Pipfile
+Pipfile.lock
+poetry.lock
+
+# Ignore Conda environment files
+env.yml
+
+# Ignore temporary Python files
+*.swp
+*.swo
+
+# Ignore any private keys or secrets (ensure you don’t store them in the repo!)
+*.key
+*.pem
+*.crt
+secrets.json
