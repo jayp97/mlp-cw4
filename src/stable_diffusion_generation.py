@@ -28,7 +28,7 @@ from diffusers.loaders import LoraLoaderMixin
 # ------------------------------------------------------------------------------
 # Configuration constants
 # ------------------------------------------------------------------------------
-HF_MODEL_ID = "runwayml/stable-diffusion-v1-5"  # Base Stable Diffusion model
+HF_MODEL_ID = "sd-legacy/stable-diffusion-v1-5"  # Base Stable Diffusion model
 SYNTHETIC_PATH = "data/synthetic/images_dermatofibroma/"  # Where generated images go
 MODEL_SAVE_PATH = "models/stable_diffusion_lora/"  # Where LoRA weights are saved
 os.makedirs(SYNTHETIC_PATH, exist_ok=True)
