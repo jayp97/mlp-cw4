@@ -1,11 +1,10 @@
-numpy
-pandas
-matplotlib
-scikit-learn
 torch
 torchvision
-tqdm
-efficientnet_pytorch
+torchaudio
+timm
 diffusers
 transformers
-albumentations
+opencv-python
+pandas
+tqdm
+matplotlib

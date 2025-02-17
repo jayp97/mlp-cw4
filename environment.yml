@@ -1,0 +1,19 @@
+name: mlp-cw4
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cudatoolkit=11.6 # or omit if using CPU or MPS
+  - pip
+  - pip:
+      - timm
+      - diffusers
+      - transformers
+      - opencv-python
+      - pandas
+      - tqdm
+      - matplotlib
