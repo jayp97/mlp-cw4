@@ -8,7 +8,42 @@ We also measure how different real-to-synthetic ratios (e.g. 1:0, 1:0.5, 1:1, 1:
 
 ## Project Structure
 
-mlp-cw4/ ├── data/ │ ├── raw/ # Original data │ ├── processed/ # Resized images │ └── synthetic/ # Synthetic images for 'df' ├── models/ │ ├── stable_diffusion_lora/ │ ├── efficientnet_checkpoints/ │ └── final/ ├── src/ │ ├── data_preprocessing.py │ ├── stable_diffusion_generation.py │ ├── classification.py │ ├── evaluation.py │ └── utils.py ├── experiments/ │ └── ratio_experiments.py ├── notebooks/ │ ├── Data_Preprocessing.ipynb │ ├── Synthetic_Generation.ipynb │ ├── Classification_Training.ipynb │ ├── Evaluation.ipynb │ └── Experiments.ipynb ├── environment.yml (or requirements.txt) └── README.md
+```
+mlp-cw4/
+├── data/
+│   ├── raw/
+│   │   ├── images/                    # Original HAM10000 images (part1 & part2 merged)
+│   │   └── HAM10000_metadata.csv      # Labels + metadata for HAM10000
+│   ├── processed/
+│   │   └── images/                    # Resized images (224x224, for example)
+│   └── synthetic/
+│       └── images_dermatofibroma/     # Synthetic images generated
+│
+├── models/
+│   ├── stable_diffusion_lora/         # (Optional) Fine-tuned SD LoRA weights
+│   ├── efficientnet_checkpoints/      # Checkpoints for classification
+│   └── final/                         # Final model(s)
+│
+├── src/
+│   ├── data_preprocessing.py          # Resizing + metadata loading
+│   ├── stable_diffusion_generation.py # Synthetic generation (fine-tuned SD / FLUX)
+│   ├── classification.py              # EfficientNetV2 training/fine-tuning
+│   ├── evaluation.py                  # Model evaluation
+│   └── utils.py                       # (Optional) helper code
+│
+├── experiments/
+│   └── ratio_experiments.py           # Runs multiple real:synthetic ratios
+│
+├── notebooks/
+│   ├── Data_Preprocessing.ipynb
+│   ├── Synthetic_Generation.ipynb
+│   ├── Classification_Training.ipynb
+│   ├── Evaluation.ipynb
+│   └── Experiments.ipynb
+│
+├── environment.yml (or requirements.txt)
+└── README.md
+```
 
 ## Steps
 
