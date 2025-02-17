@@ -1,14 +1,14 @@
 """
 evaluation.py
 
-Script for evaluating a trained EfficientNetV2-L model on the entire HAM10000
-dataset (or a subset). Reports overall accuracy and per-class accuracy.
+Evaluates a trained EfficientNetV2 model on the entire HAM10000 dataset
+(real images only) to measure class-wise and overall accuracy.
 """
 
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from PIL import Image
 import pandas as pd
 import numpy as np
@@ -18,9 +18,9 @@ import timm
 import timm.data
 
 
-class SkinLesionTestDataset(Dataset):
+class SkinLesionTestDataset(torch.utils.data.Dataset):
     """
-    Dataset for evaluation. Does not include synthetic images.
+    A dataset for evaluating the classifier on the real images only.
     """
 
     def __init__(
@@ -31,9 +31,11 @@ class SkinLesionTestDataset(Dataset):
     ):
         self.img_dir = img_dir
         self.transform = transform
+
         df = pd.read_csv(metadata_csv)
         df["filename"] = df["image_id"] + ".jpg"
         self.data = df
+
         self.labels_map = {
             "akiec": 0,
             "bcc": 1,
@@ -57,24 +59,27 @@ class SkinLesionTestDataset(Dataset):
         image = Image.open(img_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
+
         return image, label
 
 
-def evaluate_model(checkpoint_name="efficientnet_v2_synth_1.pth"):
+def evaluate_model(checkpoint_name="efficientnet_v2_synth_1.0.pth"):
     """
-    Load a saved checkpoint and compute overall and per-class accuracy.
+    Loads the specified checkpoint, evaluates on the entire dataset,
+    and prints overall + per-class accuracies.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Create model and load weights
+    # Create model
     model = timm.create_model(
         "tf_efficientnetv2_l.in21k", pretrained=True, num_classes=7
     )
-    ckpt_path = os.path.join("models/efficientnet_checkpoints", checkpoint_name)
 
+    ckpt_path = os.path.join("models/efficientnet_checkpoints/", checkpoint_name)
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
+    # Load the state dict
     state_dict = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)
@@ -82,11 +87,11 @@ def evaluate_model(checkpoint_name="efficientnet_v2_synth_1.pth"):
 
     # Create transforms for evaluation
     data_config = timm.data.resolve_data_config({}, model=model)
-    val_transform = timm.data.create_transform(**data_config, is_training=False)
+    eval_transform = timm.data.create_transform(**data_config, is_training=False)
 
-    # Create test dataset/dataloader
-    dataset = SkinLesionTestDataset(transform=val_transform)
-    dataloader = DataLoader(dataset, batch_size=16, shuffle=False)
+    # Create dataset & dataloader
+    test_dataset = SkinLesionTestDataset(transform=eval_transform)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
     correct = 0
     total = 0
@@ -95,7 +100,7 @@ def evaluate_model(checkpoint_name="efficientnet_v2_synth_1.pth"):
     class_total = np.zeros(num_classes, dtype=int)
 
     with torch.no_grad():
-        for images, labels in tqdm(dataloader, desc=f"Evaluating {checkpoint_name}"):
+        for images, labels in tqdm(test_loader, desc=f"Evaluating {checkpoint_name}"):
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             _, preds = torch.max(outputs, 1)
@@ -112,22 +117,20 @@ def evaluate_model(checkpoint_name="efficientnet_v2_synth_1.pth"):
     print(f"\n[RESULT] Overall Accuracy: {overall_acc:.2f}% ({correct}/{total})")
 
     # Print per-class stats
-    classes = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
-    for i, cls_name in enumerate(classes):
-        if class_total[i] > 0:
+    class_names = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+    for i, cls_name in enumerate(class_names):
+        if class_total[i] == 0:
+            print(f"Class '{cls_name}': No samples found.")
+        else:
             acc = 100.0 * class_correct[i] / class_total[i]
             print(
                 f"Class '{cls_name}': {acc:.2f}% ({class_correct[i]}/{class_total[i]})"
             )
-        else:
-            print(f"Class '{cls_name}': No samples found")
 
 
 def main():
-    """
-    Convenience entry point: Evaluate default checkpoint.
-    """
-    evaluate_model("efficientnet_v2_synth_1.pth")
+    # Quick test
+    evaluate_model("efficientnet_v2_synth_1.0.pth")
 
 
 if __name__ == "__main__":

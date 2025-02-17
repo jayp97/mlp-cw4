@@ -1,9 +1,8 @@
 """
 stable_diffusion_generation.py
 
-This script demonstrates how to generate synthetic images for the
-'dermatofibroma' class using a Stable Diffusion pipeline. It includes
-a placeholder for fine-tuning with LoRA or DreamBooth, if desired.
+Demonstrates how to generate synthetic images for the dermatofibroma class,
+using a base or fine-tuned Stable Diffusion pipeline.
 """
 
 import os
@@ -11,53 +10,45 @@ import torch
 import cv2
 import numpy as np
 
-# Example: Using Hugging Face diffusers
+# If using Hugging Face diffusers:
 try:
     from diffusers import StableDiffusionPipeline
 
-    # from diffusers import StableDiffusionLoRAPipeline  # If you want LoRA training
+    # from diffusers import StableDiffusionLoRAPipeline  # If you specifically want LoRA
 except ImportError:
-    print(
-        "Please install diffusers via 'pip install diffusers' if you want to run stable diffusion code."
-    )
+    print("Please install 'diffusers' and 'transformers' to run stable diffusion code.")
 
-# Example model ID (public stable diffusion checkpoint)
+# Example stable diffusion model ID
 HF_MODEL_ID = "runwayml/stable-diffusion-v1-5"
-
-# Define paths
 SYNTHETIC_PATH = "data/synthetic/images_dermatofibroma/"
 MODEL_SAVE_PATH = "models/stable_diffusion_lora/"
 
 
 def finetune_stable_diffusion_dermatofibroma():
     """
-    Placeholder function to show where you'd fine-tune stable diffusion on
-    dermatofibroma images using LoRA or DreamBooth. Actual code depends on
-    huggingface/diffusers specifics.
+    Placeholder: Implement fine-tuning of stable diffusion (LoRA or DreamBooth)
+    to generate more realistic dermatofibroma images.
     """
-    print(
-        "[INFO] Fine-tuning placeholder. Implement your LoRA/DreamBooth training here."
-    )
-    # e.g., load pipeline, train, save weights to MODEL_SAVE_PATH
+    print("[INFO] Fine-tuning placeholder. Add your LoRA or DreamBooth code here.")
 
 
 def generate_synthetic_dermatofibroma(
     num_images=50, prompt="Dermatofibroma lesion, dermoscopy image"
 ):
     """
-    Generate synthetic dermatofibroma images using a (optionally) fine-tuned pipeline.
-    By default, loads the standard stable diffusion v1.5 pipeline.
+    Generate synthetic images using a stable diffusion pipeline.
+    If you have a fine-tuned pipeline, load it instead of the base v1-5.
     """
     os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 
-    # If you had a fine-tuned pipeline, you would load it here:
+    # If you had a fine-tuned pipeline, load it here:
     # pipeline = StableDiffusionLoRAPipeline.from_pretrained(MODEL_SAVE_PATH, torch_dtype=torch.float16)
-    # For demonstration, use the base pipeline:
+    # For demonstration, just use base SD v1-5:
     pipeline = StableDiffusionPipeline.from_pretrained(
         HF_MODEL_ID, torch_dtype=torch.float16
     )
 
-    # Set device
+    # Choose device
     if torch.backends.mps.is_available():
         device = "mps"
     else:
@@ -76,9 +67,9 @@ def generate_synthetic_dermatofibroma(
 
 
 def main():
-    # 1. (Optionally) fine-tune the pipeline
+    # 1) Fine-tune (optional / placeholder)
     finetune_stable_diffusion_dermatofibroma()
-    # 2. Generate synthetic images
+    # 2) Generate synthetic images
     generate_synthetic_dermatofibroma(num_images=50)
 
 

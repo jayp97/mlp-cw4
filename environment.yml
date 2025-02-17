@@ -6,8 +6,7 @@ dependencies:
   - python=3.9
   - pytorch
   - torchvision
-  - torchaudio
-  - cudatoolkit=11.6 # or omit if using CPU or MPS
+  - cudatoolkit=11.3 # or omit if CPU/MPS only
   - pip
   - pip:
       - timm

@@ -1,8 +1,10 @@
 """
 data_preprocessing.py
 
-This script contains functions to preprocess and resize the original HAM10000
-images to a standardized size. It also loads and filters metadata as needed.
+Contains functions to preprocess the HAM10000 images and metadata:
+1) Load metadata from CSV
+2) Resize images to a fixed dimension (e.g., 224x224)
+3) Save preprocessed images to data/processed/images
 """
 
 import os
@@ -11,17 +13,16 @@ import pandas as pd
 from glob import glob
 from tqdm import tqdm
 
-# Define paths (adjust as appropriate)
+# Adjust these paths as needed
 RAW_IMAGES_PATH = "data/raw/images/"
 METADATA_PATH = "data/raw/HAM10000_metadata.csv"
 PROCESSED_PATH = "data/processed/images/"
-IMG_SIZE = (224, 224)  # For example, 224x224
+IMG_SIZE = (224, 224)  # Example size
 
 
 def load_metadata():
     """
-    Load the HAM10000 metadata CSV file which contains the diagnosis labels.
-    Returns a Pandas DataFrame.
+    Loads HAM10000 metadata CSV, returning a pandas DataFrame.
     """
     df = pd.read_csv(METADATA_PATH)
     return df
@@ -29,7 +30,7 @@ def load_metadata():
 
 def preprocess_images():
     """
-    Resize all raw images to IMG_SIZE and save them to the processed directory.
+    Resizes all raw images to IMG_SIZE and saves them in data/processed/images/.
     """
     os.makedirs(PROCESSED_PATH, exist_ok=True)
     image_paths = glob(os.path.join(RAW_IMAGES_PATH, "*.jpg"))
@@ -39,24 +40,19 @@ def preprocess_images():
         if img is None:
             print(f"Warning: Could not read {img_path}")
             continue
-
-        # Resize
         img_resized = cv2.resize(img, IMG_SIZE)
-
-        # Save
-        filename = os.path.basename(img_path)
-        save_path = os.path.join(PROCESSED_PATH, filename)
+        save_path = os.path.join(PROCESSED_PATH, os.path.basename(img_path))
         cv2.imwrite(save_path, img_resized)
 
 
 def main():
     """
-    Main entry point for preprocessing if this file is run directly.
+    If this script is run directly, we execute the preprocessing steps.
     """
     df = load_metadata()
-    print(f"Metadata loaded. Number of entries: {len(df)}")
+    print(f"Loaded metadata: {len(df)} records")
     preprocess_images()
-    print("Image preprocessing completed.")
+    print("Image preprocessing complete.")
 
 
 if __name__ == "__main__":
