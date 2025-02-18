@@ -84,7 +84,7 @@ class DermatofibromaDataset(Dataset):
 
         # Optional: We might want to apply transforms (e.g., ToTensor)
         # Since we need latents, we’ll handle it in the training loop carefully.
-        # A real pipeline might incorporate advanced transforms here.
+        # A better pipeline might incorporate advanced transforms here.
 
     def __len__(self):
         """Return how many DF images we have."""
@@ -149,7 +149,9 @@ def finetune_stable_diffusion_dermatofibroma():
     optimizer = torch.optim.AdamW(unet.parameters(), lr=1e-4)
 
     dataset = DermatofibromaDataset()  # Loads only DF images
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(
+        dataset, batch_size=BATCH_SIZE, shuffle=True
+    )  ##TODO: We need to convert the images to 512x512 so that they can be used in the model with Stable Diffusion
 
     # Move models to device
     unet.to(DEVICE)
