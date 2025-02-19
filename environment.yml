@@ -6,14 +6,17 @@ dependencies:
   - python=3.9
   - pytorch
   - torchvision
-  - cudatoolkit=11.3 # or omit if CPU/MPS only
-  - pip
-  - kaggle
+  - cudatoolkit=11.3 # Remove or adjust this line if you are on CPU/MPS
+  - pillow # For PIL (image processing)
+  - pip # Ensure pip is available
   - pip:
+      - kaggle
+      - peft
       - timm
       - diffusers
       - transformers
       - opencv-python
+      - numpy
       - pandas
       - tqdm
       - matplotlib

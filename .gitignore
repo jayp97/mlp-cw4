@@ -72,3 +72,6 @@ env.yml
 *.pem
 *.crt
 secrets.json
+
+# kaggle
+kaggle/*

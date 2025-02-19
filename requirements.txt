@@ -1,10 +1,11 @@
-torch
-torchvision
+kaggle
+peft
 timm
 diffusers
 transformers
 opencv-python
+numpy
 pandas
 tqdm
 matplotlib
-kaggle
+pillow
