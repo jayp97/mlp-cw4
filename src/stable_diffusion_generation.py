@@ -35,7 +35,9 @@ os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
-TRAIN_STEPS = 100  # Number of fine-tuning steps (adjust based on dataset size & budget)
+# Increased steps for better fine-tuning:
+TRAIN_STEPS = 1000  # Increase from 100 to 1000 (or more) to improve model adaptation
+
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
 
@@ -130,6 +132,11 @@ def finetune_stable_diffusion_dermatofibroma():
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
+    # NEW: Optionally freeze the text encoder to avoid changing prompt encoding
+    # This often helps keep the text encoder stable, focusing LoRA on the UNet only.
+    for param in text_encoder.parameters():
+        param.requires_grad = False
+
     # --------------------------------------------------------------------------
     # B. Convert the UNet model to a LoRA model
     # --------------------------------------------------------------------------
@@ -149,7 +156,9 @@ def finetune_stable_diffusion_dermatofibroma():
     # --------------------------------------------------------------------------
     # C. Set up optimizer and data
     # --------------------------------------------------------------------------
-    optimizer = torch.optim.AdamW(unet.parameters(), lr=1e-4)
+    # Lower the learning rate slightly to avoid overfitting or noisy updates
+    optimizer = torch.optim.AdamW(unet.parameters(), lr=5e-5)
+
     dataset = DermatofibromaDataset()  # Loads only DF images (512x512)
     train_loader = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn
@@ -163,15 +172,17 @@ def finetune_stable_diffusion_dermatofibroma():
     # D. Training Loop
     # --------------------------------------------------------------------------
     unet.train()
+
+    # We do TRAIN_STEPS iterations. If dataset is small, consider multiple passes over it.
+    # e.g., number_of_epochs = 5, or just keep a large TRAIN_STEPS
     for step in tqdm(range(TRAIN_STEPS), desc="Fine-tuning"):
-        # 1) Sample a batch (images, prompts)
         try:
             images, prompts = next(iter(train_loader))
         except StopIteration:
             train_iter = iter(train_loader)
             images, prompts = next(train_iter)
 
-        # 2) Tokenize text (prompts)
+        # 1) Tokenize text (prompts)
         input_ids = tokenizer(
             prompts,
             padding="max_length",
@@ -179,36 +190,37 @@ def finetune_stable_diffusion_dermatofibroma():
             truncation=True,
             return_tensors="pt",
         ).input_ids.to(DEVICE)
+
+        # If text_encoder is frozen, it won't be updated, but we still use it to get embeddings
         text_embeddings = text_encoder(input_ids)[0]  # shape [B, seq_len, hid_dim]
 
-        # 3) Convert PIL images to Tensors and move to device
-        # Ensuring images have shape [B, 3, 512, 512] in float32
+        # 2) Convert PIL images to Tensors and move to device
         images_np = np.stack(
             [np.array(img) for img in images]
         )  # shape [B, 512, 512, 3]
         images_np = np.moveaxis(images_np, -1, 1)  # => [B, 3, 512, 512]
         images_torch = torch.from_numpy(images_np).float().to(DEVICE) / 255.0
 
-        # 4) Encode images into latents with the VAE
+        # 3) Encode images into latents with the VAE
         latents_dist = vae.encode(images_torch).latent_dist
         latents = latents_dist.sample() * 0.18215  # Scale factor for SD latents
 
-        # 5) Add random noise to latents for diffusion
+        # 4) Add random noise to latents for diffusion
         noise = torch.randn_like(latents)
         timesteps = (
-            torch.randint(0, noise_scheduler.num_train_timesteps, (BATCH_SIZE,))
+            torch.randint(0, noise_scheduler.config.num_train_timesteps, (BATCH_SIZE,))
             .long()
             .to(DEVICE)
         )
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # 6) Predict the noise using the LoRA-enabled U-Net
+        # 5) Predict the noise using the LoRA-enabled U-Net
         noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
 
-        # 7) Compute MSE loss between predicted noise and the actual noise
+        # 6) Compute MSE loss between predicted noise and the actual noise
         loss = torch.nn.functional.mse_loss(noise_pred, noise)
 
-        # 8) Backprop and update
+        # 7) Backprop and update
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -249,12 +261,16 @@ def generate_synthetic_dermatofibroma(num_images=50):
     # Move pipeline to device
     pipe.to(DEVICE)
 
-    # C. Generation loop
+    # --------------------------------------------------------------------------
+    # Increase generation quality by:
+    # - Using more inference steps (num_inference_steps=100 instead of 50)
+    # - Adjusting guidance_scale=8 or 9 can sometimes yield better detail
+    # --------------------------------------------------------------------------
     for i in range(num_images):
         result = pipe(
             PROMPT_TEMPLATE,
-            num_inference_steps=50,
-            guidance_scale=7.5,
+            num_inference_steps=100,  # Increased from 50 to 100
+            guidance_scale=8.0,  # Increase for more prompt adherence
             height=IMAGE_SIZE,  # 512
             width=IMAGE_SIZE,  # 512
         )
