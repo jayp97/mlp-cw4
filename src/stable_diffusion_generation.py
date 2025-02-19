@@ -39,7 +39,7 @@ TRAIN_STEPS = 100  # Number of fine-tuning steps (adjust based on dataset size &
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
 
-# IMPORTANT: For stable diffusion v1.5, 512x512 is the typical resolution
+# For stable diffusion v1.5, 512x512 is the typical resolution
 IMAGE_SIZE = 512
 
 # This prompt is used both during training (fine-tuning) and generation
@@ -57,18 +57,31 @@ print(f"Using device: {DEVICE}")
 
 
 # ------------------------------------------------------------------------------
+# Custom Collate Function
+# ------------------------------------------------------------------------------
+def custom_collate_fn(batch):
+    """
+    Custom collate function for the DataLoader.
+    This function simply unzips the batch of (image, prompt) tuples
+    into two lists without attempting to automatically convert the PIL images.
+    """
+    images, prompts = zip(*batch)
+    return list(images), list(prompts)
+
+
+# ------------------------------------------------------------------------------
 # 1) Custom Dataset for Fine-Tuning
 # ------------------------------------------------------------------------------
 class DermatofibromaDataset(Dataset):
     """
-    Loads dermatofibroma images from `data/processed_sd/images/` (HAM10000, already
-    re-preprocessed to 512x512) and provides them, along with a text prompt.
+    Loads dermatofibroma images from `data/processed_sd/images/` (HAM10000,
+    preprocessed to 512x512) and provides them, along with a text prompt.
     """
 
     def __init__(
         self,
         metadata_path="data/raw/HAM10000_metadata.csv",
-        image_dir="data/processed_sd/images/",  # NOTE: now pointing to 512x512 folder
+        image_dir="data/processed_sd/images/",  # Now using 512x512 images
     ):
         """
         Args:
@@ -79,11 +92,8 @@ class DermatofibromaDataset(Dataset):
 
         # Load the main metadata CSV
         self.metadata = pd.read_csv(metadata_path)
-
         # Filter out only dermatofibroma rows (where dx == 'df')
         self.df_metadata = self.metadata[self.metadata["dx"] == "df"]
-
-        # Save path to the directory containing images
         self.image_dir = image_dir
 
     def __len__(self):
@@ -92,18 +102,13 @@ class DermatofibromaDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Returns a single image (as a PIL Image) and a text prompt
-        for stable diffusion fine-tuning.
+        Returns a single image (as a PIL Image) and a text prompt for stable diffusion fine-tuning.
         """
         image_id = self.df_metadata.iloc[idx]["image_id"]
         image_path = os.path.join(self.image_dir, f"{image_id}.jpg")
-
         # Load the image as PIL and convert to RGB
         image = Image.open(image_path).convert("RGB")
-
-        # We'll pair this image with a consistent prompt
         prompt = PROMPT_TEMPLATE
-
         return image, prompt
 
 
@@ -139,18 +144,16 @@ def finetune_stable_diffusion_dermatofibroma():
         init_lora_weights="gaussian",  # Initialize LoRA weights with a Gaussian distribution
     )
     unet = get_peft_model(unet, lora_config)
-
-    # Print how many parameters are trainable (LoRA typically trains only a fraction)
-    unet.print_trainable_parameters()
+    unet.print_trainable_parameters()  # Print trainable parameters
 
     # --------------------------------------------------------------------------
     # C. Set up optimizer and data
     # --------------------------------------------------------------------------
     optimizer = torch.optim.AdamW(unet.parameters(), lr=1e-4)
-
-    dataset = DermatofibromaDataset()  # Loads only DF images (512×512)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
+    dataset = DermatofibromaDataset()  # Loads only DF images (512x512)
+    train_loader = DataLoader(
+        dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn
+    )
     # Move models to device
     unet.to(DEVICE)
     text_encoder.to(DEVICE)
@@ -163,10 +166,8 @@ def finetune_stable_diffusion_dermatofibroma():
     for step in tqdm(range(TRAIN_STEPS), desc="Fine-tuning"):
         # 1) Sample a batch (images, prompts)
         try:
-            # Re-fetch the iterator if exhausted
             images, prompts = next(iter(train_loader))
         except StopIteration:
-            # If we run out of data, recreate the loader
             train_iter = iter(train_loader)
             images, prompts = next(train_iter)
 
@@ -181,7 +182,7 @@ def finetune_stable_diffusion_dermatofibroma():
         text_embeddings = text_encoder(input_ids)[0]  # shape [B, seq_len, hid_dim]
 
         # 3) Convert PIL images to Tensors and move to device
-        # Ensure shape is [B, 3, 512, 512] in float32
+        # Ensuring images have shape [B, 3, 512, 512] in float32
         images_np = np.stack(
             [np.array(img) for img in images]
         )  # shape [B, 512, 512, 3]
@@ -189,7 +190,6 @@ def finetune_stable_diffusion_dermatofibroma():
         images_torch = torch.from_numpy(images_np).float().to(DEVICE) / 255.0
 
         # 4) Encode images into latents with the VAE
-        # vae.encode() expects shape [B, 3, H, W]
         latents_dist = vae.encode(images_torch).latent_dist
         latents = latents_dist.sample() * 0.18215  # Scale factor for SD latents
 
@@ -230,12 +230,10 @@ def generate_synthetic_dermatofibroma(num_images=50):
         num_images (int): Number of synthetic images to generate.
     """
     # A. Load the base pipeline
-    #    - We pass safety_checker=None, because medical images might trigger the safety checker.
-    #    - For actual production use, consider carefully how to handle safety checks.
     pipe = StableDiffusionPipeline.from_pretrained(
         HF_MODEL_ID,
         torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        safety_checker=None,
+        safety_checker=None,  # Disable safety checker for medical images
     )
 
     # B. Load the LoRA weights if we've fine-tuned them
@@ -243,12 +241,11 @@ def generate_synthetic_dermatofibroma(num_images=50):
         pipe.unet.load_attn_procs(MODEL_SAVE_PATH)
         print("Loaded fine-tuned LoRA weights into the pipeline.")
 
-    # Move pipeline to GPU/MPS/CPU
+    # Move pipeline to device
     pipe.to(DEVICE)
 
     # C. Generation loop
     for i in range(num_images):
-        # prompt is the same as used in training
         result = pipe(
             PROMPT_TEMPLATE,
             num_inference_steps=50,
@@ -268,11 +265,8 @@ def main():
     """
     Main function to fine-tune Stable Diffusion with LoRA, then generate synthetic images.
     """
-    # Step 1: Fine-tune
-    finetune_stable_diffusion_dermatofibroma()
-
-    # Step 2: Generate images
-    generate_synthetic_dermatofibroma(num_images=50)
+    finetune_stable_diffusion_dermatofibroma()  # Step 1: Fine-tune
+    generate_synthetic_dermatofibroma(num_images=50)  # Step 2: Generate images
 
 
 if __name__ == "__main__":
