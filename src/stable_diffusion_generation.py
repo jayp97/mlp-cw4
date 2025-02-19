@@ -81,7 +81,7 @@ class DermatofibromaDataset(Dataset):
     def __init__(
         self,
         metadata_path="data/raw/HAM10000_metadata.csv",
-        image_dir="data/processed_sd/images/",  # Now using 512x512 images
+        image_dir="data/processed_sd/images/",  # Using 512x512 images
     ):
         """
         Args:
@@ -237,9 +237,14 @@ def generate_synthetic_dermatofibroma(num_images=50):
     )
 
     # B. Load the LoRA weights if we've fine-tuned them
-    if os.path.exists(MODEL_SAVE_PATH):
+    lora_weights_file = os.path.join(MODEL_SAVE_PATH, "pytorch_lora_weights.bin")
+    if os.path.exists(lora_weights_file):
         pipe.unet.load_attn_procs(MODEL_SAVE_PATH)
         print("Loaded fine-tuned LoRA weights into the pipeline.")
+    else:
+        print(
+            f"LoRA weights file not found in {MODEL_SAVE_PATH}. Using base model weights."
+        )
 
     # Move pipeline to device
     pipe.to(DEVICE)
