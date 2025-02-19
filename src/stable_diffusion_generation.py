@@ -38,7 +38,11 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 TRAIN_STEPS = 100  # Number of fine-tuning steps (adjust based on dataset size & budget)
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
-IMAGE_SIZE = 224  # Target height/width of the images. (SD is usually 512, but 224 used here for demonstration)
+
+# IMPORTANT: For stable diffusion v1.5, 512x512 is the typical resolution
+IMAGE_SIZE = 512
+
+# This prompt is used both during training (fine-tuning) and generation
 PROMPT_TEMPLATE = (
     "A dermatofibroma lesion, dermoscopy image, high quality clinical photograph"
 )
@@ -57,19 +61,19 @@ print(f"Using device: {DEVICE}")
 # ------------------------------------------------------------------------------
 class DermatofibromaDataset(Dataset):
     """
-    Loads dermatofibroma images from `data/processed/images/` (HAM10000, already
-    preprocessed) and provides them, along with a text prompt.
+    Loads dermatofibroma images from `data/processed_sd/images/` (HAM10000, already
+    re-preprocessed to 512x512) and provides them, along with a text prompt.
     """
 
     def __init__(
         self,
         metadata_path="data/raw/HAM10000_metadata.csv",
-        image_dir="data/processed/images/",
+        image_dir="data/processed_sd/images/",  # NOTE: now pointing to 512x512 folder
     ):
         """
         Args:
             metadata_path (str): Path to the HAM10000 metadata CSV file.
-            image_dir (str): Directory containing the processed (resized) images.
+            image_dir (str): Directory containing the 512x512 images for SD.
         """
         import pandas as pd
 
@@ -81,10 +85,6 @@ class DermatofibromaDataset(Dataset):
 
         # Save path to the directory containing images
         self.image_dir = image_dir
-
-        # Optional: We might want to apply transforms (e.g., ToTensor)
-        # Since we need latents, we’ll handle it in the training loop carefully.
-        # A better pipeline might incorporate advanced transforms here.
 
     def __len__(self):
         """Return how many DF images we have."""
@@ -148,10 +148,8 @@ def finetune_stable_diffusion_dermatofibroma():
     # --------------------------------------------------------------------------
     optimizer = torch.optim.AdamW(unet.parameters(), lr=1e-4)
 
-    dataset = DermatofibromaDataset()  # Loads only DF images
-    train_loader = DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True
-    )  ##TODO: We need to convert the images to 512x512 so that they can be used in the model with Stable Diffusion
+    dataset = DermatofibromaDataset()  # Loads only DF images (512×512)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # Move models to device
     unet.to(DEVICE)
@@ -183,15 +181,15 @@ def finetune_stable_diffusion_dermatofibroma():
         text_embeddings = text_encoder(input_ids)[0]  # shape [B, seq_len, hid_dim]
 
         # 3) Convert PIL images to Tensors and move to device
-        # Note: We must ensure images have shape (B, 3, H, W) in float32
-        # Below is a minimal approach converting from PIL -> Numpy -> Torch
-        # A more standard approach might be using torchvision transforms.
-        images_np = np.stack([np.array(img) for img in images])  # shape [B, H, W, 3]
-        images_np = np.moveaxis(images_np, -1, 1)  # => [B, 3, H, W]
+        # Ensure shape is [B, 3, 512, 512] in float32
+        images_np = np.stack(
+            [np.array(img) for img in images]
+        )  # shape [B, 512, 512, 3]
+        images_np = np.moveaxis(images_np, -1, 1)  # => [B, 3, 512, 512]
         images_torch = torch.from_numpy(images_np).float().to(DEVICE) / 255.0
 
         # 4) Encode images into latents with the VAE
-        # vae.encode() expects shape [B, 3, H, W], so that should match
+        # vae.encode() expects shape [B, 3, H, W]
         latents_dist = vae.encode(images_torch).latent_dist
         latents = latents_dist.sample() * 0.18215  # Scale factor for SD latents
 
@@ -255,8 +253,8 @@ def generate_synthetic_dermatofibroma(num_images=50):
             PROMPT_TEMPLATE,
             num_inference_steps=50,
             guidance_scale=7.5,
-            height=IMAGE_SIZE,
-            width=IMAGE_SIZE,
+            height=IMAGE_SIZE,  # 512
+            width=IMAGE_SIZE,  # 512
         )
         image = result.images[0]
 
@@ -270,8 +268,11 @@ def main():
     """
     Main function to fine-tune Stable Diffusion with LoRA, then generate synthetic images.
     """
-    finetune_stable_diffusion_dermatofibroma()  # Step 1: Fine-tune
-    generate_synthetic_dermatofibroma(num_images=50)  # Step 2: Generate images
+    # Step 1: Fine-tune
+    finetune_stable_diffusion_dermatofibroma()
+
+    # Step 2: Generate images
+    generate_synthetic_dermatofibroma(num_images=50)
 
 
 if __name__ == "__main__":
