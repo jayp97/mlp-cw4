@@ -49,8 +49,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--raw-data-path",
         type=str,
-        default="data/raw",
+        default=os.path.join(os.path.dirname(__file__), "../data/raw"),  # Updated path
         help="Path to store the raw data (default: data/raw)",
     )
     args = parser.parse_args()
-    download_ham10000(args.raw_data_path)
+    download_ham10000(os.path.abspath(args.raw_data_path))
