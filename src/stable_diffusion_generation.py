@@ -28,7 +28,7 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
 TRAIN_STEPS = 1000
-LORA_RANK = 4  # Not used here because older LoRAAttnProcessor doesn't accept it
+LORA_RANK = 4  # Not used because the older LoRAAttnProcessor doesn't accept it
 BATCH_SIZE = 2
 ACCUMULATION_STEPS = 4
 LR = 1e-5
@@ -111,16 +111,11 @@ def collate_fn(batch):
 def inject_lora(unet, text_encoder):
     """
     Inject LoRA into the UNet and Text Encoder.
-    Note: We do NOT pass 'rank' or 'cross_attention_dim', as the older
-          LoRAAttnProcessor version installed doesn't accept these.
+    For compatibility with your environment we force using the original
+    LoRAAttnProcessor, which is callable.
     """
-
-    # Select appropriate processor class based on Torch version
-    attn_processor_cls = (
-        LoRAAttnProcessor2_0
-        if hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        else LoRAAttnProcessor
-    )
+    # Force use the original, callable LoRAAttnProcessor.
+    attn_processor_cls = LoRAAttnProcessor
 
     # Configure UNet attention processors
     unet_lora_attn_procs = {}
@@ -148,7 +143,7 @@ def finetune_stable_diffusion_dermatofibroma():
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
-    # Inject LoRA without 'rank'
+    # Inject LoRA without using additional parameters
     inject_lora(unet, text_encoder)
 
     unet.to(DEVICE)
