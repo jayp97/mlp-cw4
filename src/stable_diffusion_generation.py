@@ -28,7 +28,7 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
 TRAIN_STEPS = 1000
-LORA_RANK = 4  # Not used because the older LoRAAttnProcessor doesn't accept it
+LORA_RANK = 4  # Not used because older LoRAAttnProcessor doesn't accept it
 BATCH_SIZE = 2
 ACCUMULATION_STEPS = 4
 LR = 1e-5
@@ -111,28 +111,34 @@ def collate_fn(batch):
 def inject_lora(unet, text_encoder):
     """
     Inject LoRA into the UNet and Text Encoder.
-    For compatibility with your environment we force using the original
-    LoRAAttnProcessor, which is callable.
+    To avoid the error 'LoRAAttnProcessor2_0' object has no attribute '__call__',
+    we force any instance of LoRAAttnProcessor2_0 to be replaced by the callable
+    LoRAAttnProcessor.
     """
-    # Force use the original, callable LoRAAttnProcessor.
-    attn_processor_cls = LoRAAttnProcessor
-
-    # Configure UNet attention processors
-    unet_lora_attn_procs = {}
+    # For UNet: replace all attention processors with LoRAAttnProcessor.
+    new_processors = {}
     for name in unet.attn_processors.keys():
-        unet_lora_attn_procs[name] = attn_processor_cls()
+        new_processors[name] = LoRAAttnProcessor()
+    unet.set_attn_processor(new_processors)
+    # Additionally, traverse all submodules and if any processor is of type
+    # LoRAAttnProcessor2_0, replace it.
+    for module in unet.modules():
+        if hasattr(module, "processor") and isinstance(
+            module.processor, LoRAAttnProcessor2_0
+        ):
+            module.processor = LoRAAttnProcessor()
 
-    unet.set_attn_processor(unet_lora_attn_procs)
-
-    # Configure Text Encoder attention processors
-    text_lora_attn_procs = {}
+    # For text encoder: replace any processor of type LoRAAttnProcessor2_0.
+    for name, module in text_encoder.named_modules():
+        if hasattr(module, "processor") and isinstance(
+            module.processor, LoRAAttnProcessor2_0
+        ):
+            module.processor = LoRAAttnProcessor()
+    # Also, for any attention layers that lack a processor, assign one.
     for name, module in text_encoder.named_modules():
         if "attention.self" in name and "text_model.encoder.layers" in name:
-            text_lora_attn_procs[name] = attn_processor_cls()
-
-    for name, module in text_encoder.named_modules():
-        if name in text_lora_attn_procs:
-            module.processor = text_lora_attn_procs[name]
+            if not hasattr(module, "processor") or module.processor is None:
+                module.processor = LoRAAttnProcessor()
 
 
 def finetune_stable_diffusion_dermatofibroma():
@@ -143,7 +149,7 @@ def finetune_stable_diffusion_dermatofibroma():
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
-    # Inject LoRA without using additional parameters
+    # Inject LoRA (with processor replacement)
     inject_lora(unet, text_encoder)
 
     unet.to(DEVICE)
