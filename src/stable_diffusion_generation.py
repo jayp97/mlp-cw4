@@ -1,15 +1,17 @@
 """
-stable_diffusion_generation.py
-
-This script fine-tunes Stable Diffusion using LoRA on the dermatofibroma class from the HAM10000 dataset
-and generates synthetic images to overbalance the class. The synthetic images are saved in the
-`data/synthetic/images_dermatofibroma/` directory for later use in training the EfficientNetV2 model.
+Improvements Implemented:
+- Set random seed for reproducibility.
+- Updated the training loop to use a persistent DataLoader iterator with loss logging.
+- Incorporated mixed precision training (AMP) when using CUDA.
+- Increased inference steps during generation for improved image quality.
+- Added comments suggesting further tuning (e.g., prompt refinement).
 """
 
 import os
 import torch
 import cv2
 import numpy as np
+import random
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from peft import LoraConfig, get_peft_model
@@ -25,6 +27,20 @@ from diffusers import (
 from transformers import CLIPTextModel, CLIPTokenizer
 from diffusers.loaders import LoraLoaderMixin
 
+
+# -------------------------------
+# Set random seed for reproducibility
+# -------------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed(42)
+
 # ------------------------------------------------------------------------------
 # Configuration constants
 # ------------------------------------------------------------------------------
@@ -35,16 +51,15 @@ os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
-# Increased steps for better fine-tuning:
-TRAIN_STEPS = 1000  # Increase from 100 to 1000 (or more) to improve model adaptation
-
+TRAIN_STEPS = 1000  # You may experiment with further increasing this number if needed.
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
 
 # For stable diffusion v1.5, 512x512 is the typical resolution
 IMAGE_SIZE = 512
 
-# This prompt is used both during training (fine-tuning) and generation
+# Prompt used during training and generation.
+# Consider refining this prompt if the generated images do not match your fine-tuning examples.
 PROMPT_TEMPLATE = (
     "A dermatofibroma lesion, dermoscopy image, high quality clinical photograph"
 )
@@ -83,8 +98,7 @@ def check_required_data():
 def custom_collate_fn(batch):
     """
     Custom collate function for the DataLoader.
-    This function simply unzips the batch of (image, prompt) tuples
-    into two lists without attempting to automatically convert the PIL images.
+    This function unzips the batch of (image, prompt) tuples into two lists.
     """
     images, prompts = zip(*batch)
     return list(images), list(prompts)
@@ -95,8 +109,8 @@ def custom_collate_fn(batch):
 # ------------------------------------------------------------------------------
 class DermatofibromaDataset(Dataset):
     """
-    Loads dermatofibroma images from `data/processed_sd/images/` (HAM10000,
-    preprocessed to 512x512) and provides them, along with a text prompt.
+    Loads dermatofibroma images from `data/processed_sd/images/` (HAM10000, preprocessed to 512x512)
+    and provides them along with a text prompt.
     """
 
     def __init__(
@@ -104,37 +118,28 @@ class DermatofibromaDataset(Dataset):
         metadata_path="data/raw/HAM10000_metadata.csv",
         image_dir="data/processed_sd/images/",  # Using 512x512 images
     ):
-        """
-        Args:
-            metadata_path (str): Path to the HAM10000 metadata CSV file.
-            image_dir (str): Directory containing the 512x512 images for SD.
-        """
         import pandas as pd
 
         # Load the main metadata CSV
         self.metadata = pd.read_csv(metadata_path)
-        # Filter out only dermatofibroma rows (where dx == 'df')
+        # Filter for dermatofibroma rows (where dx == 'df')
         self.df_metadata = self.metadata[self.metadata["dx"] == "df"]
         self.image_dir = image_dir
 
     def __len__(self):
-        """Return how many DF images we have."""
         return len(self.df_metadata)
 
     def __getitem__(self, idx):
-        """
-        Returns a single image (as a PIL Image) and a text prompt for stable diffusion fine-tuning.
-        """
         image_id = self.df_metadata.iloc[idx]["image_id"]
         image_path = os.path.join(self.image_dir, f"{image_id}.jpg")
-        # Load the image as PIL and convert to RGB
+        # Load image and convert to RGB
         image = Image.open(image_path).convert("RGB")
         prompt = PROMPT_TEMPLATE
         return image, prompt
 
 
 # ------------------------------------------------------------------------------
-# 2) Fine-Tuning with LoRA
+# 2) Fine-Tuning with LoRA and Mixed Precision Training
 # ------------------------------------------------------------------------------
 def finetune_stable_diffusion_dermatofibroma():
     """
@@ -142,23 +147,18 @@ def finetune_stable_diffusion_dermatofibroma():
     The resulting LoRA weights are saved to MODEL_SAVE_PATH.
     """
 
-    # --------------------------------------------------------------------------
-    # A. Load Stable Diffusion components from a base checkpoint
-    # --------------------------------------------------------------------------
+    # A. Load Stable Diffusion components from the base checkpoint
     unet = UNet2DConditionModel.from_pretrained(HF_MODEL_ID, subfolder="unet")
     text_encoder = CLIPTextModel.from_pretrained(HF_MODEL_ID, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(HF_MODEL_ID, subfolder="vae")
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
-    # NEW: Optionally freeze the text encoder to avoid changing prompt encoding
-    # This often helps keep the text encoder stable, focusing LoRA on the UNet only.
+    # Freeze text encoder to keep prompt embeddings stable
     for param in text_encoder.parameters():
         param.requires_grad = False
 
-    # --------------------------------------------------------------------------
     # B. Convert the UNet model to a LoRA model
-    # --------------------------------------------------------------------------
     lora_config = LoraConfig(
         r=LORA_RANK,
         target_modules=[
@@ -172,31 +172,27 @@ def finetune_stable_diffusion_dermatofibroma():
     unet = get_peft_model(unet, lora_config)
     unet.print_trainable_parameters()  # Print trainable parameters
 
-    # --------------------------------------------------------------------------
     # C. Set up optimizer and data
-    # --------------------------------------------------------------------------
-    # Lower the learning rate slightly to avoid overfitting or noisy updates
     optimizer = torch.optim.AdamW(unet.parameters(), lr=5e-5)
-
     dataset = DermatofibromaDataset()  # Loads only DF images (512x512)
     train_loader = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn
     )
+
     # Move models to device
     unet.to(DEVICE)
     text_encoder.to(DEVICE)
     vae.to(DEVICE)
 
-    # --------------------------------------------------------------------------
-    # D. Training Loop
-    # --------------------------------------------------------------------------
-    unet.train()
+    # Setup mixed precision scaler if using CUDA
+    scaler = torch.cuda.amp.GradScaler() if DEVICE == "cuda" else None
 
-    # We do TRAIN_STEPS iterations. If dataset is small, consider multiple passes over it.
-    # e.g., number_of_epochs = 5, or just keep a large TRAIN_STEPS
+    # D. Training Loop with persistent DataLoader iterator and loss logging
+    unet.train()
+    train_iter = iter(train_loader)
     for step in tqdm(range(TRAIN_STEPS), desc="Fine-tuning"):
         try:
-            images, prompts = next(iter(train_loader))
+            images, prompts = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
             images, prompts = next(train_iter)
@@ -210,14 +206,12 @@ def finetune_stable_diffusion_dermatofibroma():
             return_tensors="pt",
         ).input_ids.to(DEVICE)
 
-        # If text_encoder is frozen, it won't be updated, but we still use it to get embeddings
+        # Obtain text embeddings (text encoder is frozen)
         text_embeddings = text_encoder(input_ids)[0]  # shape [B, seq_len, hid_dim]
 
         # 2) Convert PIL images to Tensors and move to device
-        images_np = np.stack(
-            [np.array(img) for img in images]
-        )  # shape [B, 512, 512, 3]
-        images_np = np.moveaxis(images_np, -1, 1)  # => [B, 3, 512, 512]
+        images_np = np.stack([np.array(img) for img in images])  # [B, 512, 512, 3]
+        images_np = np.moveaxis(images_np, -1, 1)  # [B, 3, 512, 512]
         images_torch = torch.from_numpy(images_np).float().to(DEVICE) / 255.0
 
         # 3) Encode images into latents with the VAE
@@ -233,26 +227,36 @@ def finetune_stable_diffusion_dermatofibroma():
         )
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # 5) Predict the noise using the LoRA-enabled U-Net
-        noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
+        # 5) Predict the noise using the LoRA-enabled UNet
+        if DEVICE == "cuda":
+            with torch.cuda.amp.autocast():
+                noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
+                loss = torch.nn.functional.mse_loss(noise_pred, noise)
+        else:
+            noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
+            loss = torch.nn.functional.mse_loss(noise_pred, noise)
 
-        # 6) Compute MSE loss between predicted noise and the actual noise
-        loss = torch.nn.functional.mse_loss(noise_pred, noise)
-
-        # 7) Backprop and update
+        # 6) Backpropagation and optimizer step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
-    # --------------------------------------------------------------------------
+        # Logging training loss every 50 steps
+        if step % 50 == 0:
+            print(f"Step {step}, Loss: {loss.item()}")
+
     # E. Save LoRA weights
-    # --------------------------------------------------------------------------
     unet.save_pretrained(MODEL_SAVE_PATH)
     print(f"Saved fine-tuned LoRA weights to {MODEL_SAVE_PATH}")
 
 
 # ------------------------------------------------------------------------------
-# 3) Generating Synthetic Images
+# 3) Generating Synthetic Images with Enhanced Inference Settings
 # ------------------------------------------------------------------------------
 def generate_synthetic_dermatofibroma(num_images=50):
     """
@@ -267,7 +271,7 @@ def generate_synthetic_dermatofibroma(num_images=50):
         safety_checker=None,  # Disable safety checker for medical images
     )
 
-    # B. Load the LoRA weights if we've fine-tuned them
+    # B. Load the LoRA weights if available
     lora_weights_file = os.path.join(MODEL_SAVE_PATH, "pytorch_lora_weights.bin")
     if os.path.exists(lora_weights_file):
         pipe.unet.load_attn_procs(MODEL_SAVE_PATH)
@@ -280,27 +284,26 @@ def generate_synthetic_dermatofibroma(num_images=50):
     # Move pipeline to device
     pipe.to(DEVICE)
 
-    # --------------------------------------------------------------------------
-    # Increase generation quality by:
-    # - Using more inference steps (num_inference_steps=100 instead of 50)
-    # - Adjusting guidance_scale=8 or 9 can sometimes yield better detail
-    # --------------------------------------------------------------------------
+    # C. Generate images with increased inference steps for better quality
     for i in range(num_images):
         result = pipe(
             PROMPT_TEMPLATE,
-            num_inference_steps=100,  # Increased from 50 to 100
-            guidance_scale=8.0,  # Increase for more prompt adherence
-            height=IMAGE_SIZE,  # 512
-            width=IMAGE_SIZE,  # 512
+            num_inference_steps=150,  # Increased inference steps from 100 to 150
+            guidance_scale=8.0,  # Adjust guidance scale as needed
+            height=IMAGE_SIZE,
+            width=IMAGE_SIZE,
         )
         image = result.images[0]
 
-        # D. Save the generated image
+        # Save the generated image
         save_path = os.path.join(SYNTHETIC_PATH, f"synthetic_df_{i+1}.jpg")
         image.save(save_path)
         print(f"Generated synthetic image: {save_path}")
 
 
+# ------------------------------------------------------------------------------
+# Main Function
+# ------------------------------------------------------------------------------
 def main():
     """
     Main function to fine-tune Stable Diffusion with LoRA, then generate synthetic images.
