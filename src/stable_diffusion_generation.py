@@ -1,9 +1,13 @@
 import os
 import torch
+import cv2
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+
+# PEFT / LoRA
+from peft import LoraConfig, get_peft_model
 
 # Hugging Face / Diffusers
 from diffusers import (
@@ -11,9 +15,8 @@ from diffusers import (
     DDPMScheduler,
     UNet2DConditionModel,
     AutoencoderKL,
-    LoRAAttnProcessor,
-    AttnProcessor2_0,
 )
+from diffusers.loaders import LoraLoaderMixin  # for load_attn_procs, if available
 from transformers import CLIPTextModel, CLIPTokenizer
 
 # ------------------------------------------------------------------------------
@@ -26,13 +29,12 @@ os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
-TRAIN_STEPS = 1000  # total steps before stopping
+TRAIN_STEPS = 1000  # total steps to train
+LORA_RANK = 4
 BATCH_SIZE = 2
-ACCUMULATION_STEPS = 4  # gradient accumulation
+ACCUMULATION_STEPS = 4
 LR = 1e-5
-EPOCHS = 2  # example: 2 epochs
-LORA_RANK = 4  # rank for LoRA
-LORA_ALPHA = 1  # scaling factor for LoRA
+EPOCHS = 2  # Example: two epochs
 
 IMAGE_SIZE = 512
 PROMPT_TEMPLATE = (
@@ -44,7 +46,7 @@ print(f"Using device: {DEVICE}")
 
 
 # ------------------------------------------------------------------------------
-# Debug Functions (optional)
+# Debug Functions
 # ------------------------------------------------------------------------------
 def debug_file_paths():
     """Check that a sample image file exists at the specified path."""
@@ -89,7 +91,7 @@ class DermatofibromaDataset(Dataset):
         self.image_dir = image_dir
         self.prompt = PROMPT_TEMPLATE
 
-        # Verify that each dermatofibroma image actually exists
+        # Verify that each row's corresponding image actually exists
         self.valid_rows = []
         for idx in range(len(self.df_metadata)):
             image_id = self.df_metadata.iloc[idx]["image_id"]
@@ -116,64 +118,15 @@ def collate_fn(batch):
 
 
 # ------------------------------------------------------------------------------
-# Functions to inject LoRA layers into UNet / Text Encoder
-# ------------------------------------------------------------------------------
-def enable_lora_for_unet(unet, r=4, alpha=1):
-    """
-    Replaces AttnProcessor2_0 with LoRAAttnProcessor in all cross/self-attn modules
-    within the UNet.
-    """
-    for name, module in unet.attn_processors.items():
-        if isinstance(module, AttnProcessor2_0):
-            # The module knows its own hidden/cross_attention dimensions
-            hidden_size = module.out_dim
-            cross_attention_dim = module.out_dim
-
-            # Replace it with a LoRAAttnProcessor:
-            unet.attn_processors[name] = LoRAAttnProcessor(
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-                rank=r,
-                lora_alpha=alpha,
-            )
-
-
-def enable_lora_for_text_encoder(text_encoder, r=4, alpha=1):
-    """
-    For each self-attention module in the text encoder,
-    replace with LoRAAttnProcessor.
-    """
-    # For CLIPTextModel, each layer has .self_attn or similar
-    # We'll do a simple approach: check submodules for AttnProcessor2_0.
-    for name, submodule in text_encoder.named_modules():
-        if isinstance(submodule, AttnProcessor2_0):
-            hidden_size = submodule.out_dim
-            cross_attention_dim = submodule.out_dim
-            parent_module = text_encoder.get_submodule(name.rsplit(".", 1)[0])
-            # e.g. parent might be a CLIPEncoderLayer
-
-            # Replace the entire submodule key with LoRAAttnProcessor
-            # Not all text encoder modules have it, so be safe:
-            if hasattr(parent_module, "attn_processor"):
-                parent_module.attn_processor = LoRAAttnProcessor(
-                    hidden_size=hidden_size,
-                    cross_attention_dim=cross_attention_dim,
-                    rank=r,
-                    lora_alpha=alpha,
-                )
-
-
-# ------------------------------------------------------------------------------
-# Fine-tuning function
+# Fine-tuning function (PEFT-based)
 # ------------------------------------------------------------------------------
 def finetune_stable_diffusion_dermatofibroma():
     """
-    Fine-tune (LoRA) the Stable Diffusion UNet (and text encoder, optional)
-    on the dermatofibroma class. LoRA weights get saved to the specified folders
-    in a format recognized by Diffusers' load_attn_procs().
+    Fine-tune Stable Diffusion on the dermatofibroma class using LoRA via PEFT,
+    then rename the file (pytorch_model.bin or adapter_model.bin) to 'pytorch_lora_weights.bin'
+    so Diffusers can load it with load_attn_procs().
     """
-    # 1) Load the base models
-    print("Loading UNet, VAE, Text Encoder...")
+    # 1) Load base models
     unet = UNet2DConditionModel.from_pretrained(HF_MODEL_ID, subfolder="unet")
     text_encoder = CLIPTextModel.from_pretrained(HF_MODEL_ID, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(HF_MODEL_ID, subfolder="vae")
@@ -184,25 +137,29 @@ def finetune_stable_diffusion_dermatofibroma():
     text_encoder.to(DEVICE)
     vae.to(DEVICE)
 
-    # 2) Inject LoRA layers into UNet and Text Encoder
-    enable_lora_for_unet(unet, r=LORA_RANK, alpha=LORA_ALPHA)
-    enable_lora_for_text_encoder(text_encoder, r=LORA_RANK, alpha=LORA_ALPHA)
+    # 2) PEFT LoRA configs (no init_lora_weights => default)
+    #    We'll keep the default alpha=32 or so, but you can adjust as needed.
+    lora_config_unet = LoraConfig(
+        r=LORA_RANK,
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],  # typical attention blocks
+        lora_alpha=1,  # you can adjust
+    )
+    lora_config_text = LoraConfig(
+        r=LORA_RANK,
+        target_modules=["k_proj", "q_proj", "v_proj", "out_proj"],
+        lora_alpha=1,
+    )
+
+    # Convert them to LoRA
+    unet = get_peft_model(unet, lora_config_unet)
+    text_encoder = get_peft_model(text_encoder, lora_config_text)
 
     unet.train()
     text_encoder.train()
 
-    # 3) Prepare an optimizer for the newly introduced LoRA parameters
-    #    Usually we freeze the base model weights and train only LoRA
-    #    modules. For simplicity, let's do that explicitly:
-    lora_params = []
-    for param in unet.parameters():
-        if param.requires_grad:
-            lora_params.append(param)
-    for param in text_encoder.parameters():
-        if param.requires_grad:
-            lora_params.append(param)
-
-    optimizer = torch.optim.AdamW(lora_params, lr=LR)
+    # 3) Optimizer
+    params_to_optimize = list(unet.parameters()) + list(text_encoder.parameters())
+    optimizer = torch.optim.AdamW(params_to_optimize, lr=LR)
 
     # 4) Data
     dataset = DermatofibromaDataset()
@@ -228,8 +185,7 @@ def finetune_stable_diffusion_dermatofibroma():
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(DEVICE)
-            # text encoder forward
-            text_embeddings = text_encoder(input_ids)[0]
+            text_embeddings = text_encoder(input_ids)[0]  # [batch, seq_len, hidden_dim]
 
             # 4b) Convert images to latents
             images_np = np.stack([np.array(img) for img in images])  # shape [B,H,W,C]
@@ -250,10 +206,10 @@ def finetune_stable_diffusion_dermatofibroma():
             ).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # 4d) UNet predicts the noise
+            # 4d) Predict noise with the UNet
             noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
 
-            # 4e) MSE loss
+            # 4e) Loss
             loss = torch.nn.functional.mse_loss(noise_pred, noise)
             loss.backward()
 
@@ -269,18 +225,48 @@ def finetune_stable_diffusion_dermatofibroma():
         if global_step >= TRAIN_STEPS:
             break
 
-    print("Training complete.")
+    print("LoRA training complete; now saving weights...")
 
-    # 5) Save LoRA weights in diffusers format
-    unet_out_dir = os.path.join(MODEL_SAVE_PATH, "unet_lora")
-    text_out_dir = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
+    # 5) Save LoRA weights
+    #    By default, PEFT might produce 'pytorch_model.bin' or 'adapter_model.bin'.
+    #    Let's store them in separate subfolders and rename them so diffusers can read.
+    unet_dir = os.path.join(MODEL_SAVE_PATH, "unet_lora")
+    text_dir = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
+    os.makedirs(unet_dir, exist_ok=True)
+    os.makedirs(text_dir, exist_ok=True)
 
-    unet.save_attn_procs(unet_out_dir)
-    text_encoder.save_attn_procs(text_out_dir)
+    unet.save_pretrained(unet_dir)
+    text_encoder.save_pretrained(text_dir)
 
-    print(
-        f"LoRA fine-tuning complete; weights saved to:\n {unet_out_dir}\n {text_out_dir}"
-    )
+    print("LoRA fine-tuning weights saved.")
+    rename_peft_to_diffusers_lora(unet_dir)
+    rename_peft_to_diffusers_lora(text_dir)
+
+
+def rename_peft_to_diffusers_lora(folder: str):
+    """
+    1) PEFT might produce 'pytorch_model.bin' or 'adapter_model.bin' in `folder`.
+    2) Diffusers expects 'pytorch_lora_weights.bin' to load via load_attn_procs().
+    We'll rename whichever file we find to the required name.
+    """
+    possible_files = ["pytorch_model.bin", "adapter_model.bin"]
+    target_file = os.path.join(folder, "pytorch_lora_weights.bin")
+
+    found_file = None
+    for fname in possible_files:
+        fpath = os.path.join(folder, fname)
+        if os.path.exists(fpath):
+            found_file = fpath
+            break
+
+    if found_file:
+        # If there's already a 'pytorch_lora_weights.bin', remove it first
+        if os.path.exists(target_file):
+            os.remove(target_file)
+        os.rename(found_file, target_file)
+        print(f"Renamed {found_file} -> {target_file}")
+    else:
+        print(f"No LoRA bin file found in {folder}; skipping rename.")
 
 
 # ------------------------------------------------------------------------------
@@ -301,7 +287,7 @@ def generate_synthetic_dermatofibroma(num_images=50):
     unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
 
-    # If these directories exist, load the LoRA weights
+    # If these directories exist, load the LoRA weights (pytorch_lora_weights.bin)
     if os.path.isdir(unet_lora_path):
         pipe.unet.load_attn_procs(unet_lora_path)
     else:
@@ -310,7 +296,9 @@ def generate_synthetic_dermatofibroma(num_images=50):
     if os.path.isdir(text_encoder_lora_path):
         pipe.text_encoder.load_attn_procs(text_encoder_lora_path)
     else:
-        print(f"Warning: {text_encoder_lora_path} not found. Using base text weights.")
+        print(
+            f"Warning: {text_encoder_lora_path} not found. Using base text encoder weights."
+        )
 
     print("Loaded LoRA (UNet + Text Encoder) if available.")
     pipe.enable_attention_slicing()
@@ -343,7 +331,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Stable Diffusion Fine-tuning & Generation with LoRA"
+        description="Stable Diffusion Fine-tuning & Generation with LoRA (PEFT-based)"
     )
     parser.add_argument(
         "--debug", action="store_true", help="Run debug checks and exit."
