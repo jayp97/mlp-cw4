@@ -123,7 +123,8 @@ def collate_fn(batch):
 def finetune_stable_diffusion_dermatofibroma():
     """
     Fine-tune Stable Diffusion on the dermatofibroma class using LoRA via PEFT,
-    then rename the adapter file to 'pytorch_lora_weights.bin' so diffusers can load it later.
+    then rename the file (pytorch_model.bin or adapter_model.bin) to 'pytorch_lora_weights.bin'
+    so diffusers can load it with load_attn_procs().
     """
     # 1) Load base models
     unet = UNet2DConditionModel.from_pretrained(HF_MODEL_ID, subfolder="unet")
@@ -226,28 +227,35 @@ def finetune_stable_diffusion_dermatofibroma():
     text_encoder.save_pretrained(text_dir)
     print("LoRA fine-tuning complete; weights saved.")
 
-    # 7) Rename 'adapter_model.bin' -> 'pytorch_lora_weights.bin' for each subfolder
-    rename_peft_adapter_to_lora(unet_dir)
-    rename_peft_adapter_to_lora(text_dir)
+    # 7) Rename possible PEFT output (pytorch_model.bin or adapter_model.bin)
+    rename_peft_to_diffusers_lora(unet_dir)
+    rename_peft_to_diffusers_lora(text_dir)
 
 
-def rename_peft_adapter_to_lora(folder: str):
+def rename_peft_to_diffusers_lora(folder: str):
     """
-    If 'adapter_model.bin' is found, rename/copy it to 'pytorch_lora_weights.bin'
-    so that diffusers can load it with `load_attn_procs()`.
+    1) PEFT might produce 'pytorch_model.bin' or 'adapter_model.bin'.
+    2) Diffusers expects 'pytorch_lora_weights.bin'.
+    We'll rename whichever file we find to the required name.
     """
-    adapter_model_path = os.path.join(folder, "adapter_model.bin")
+    possible_files = ["pytorch_model.bin", "adapter_model.bin"]
     lora_model_path = os.path.join(folder, "pytorch_lora_weights.bin")
 
-    if os.path.exists(adapter_model_path):
-        # If 'pytorch_lora_weights.bin' already exists, remove or rename it first
+    found_file = None
+    for candidate in possible_files:
+        candidate_path = os.path.join(folder, candidate)
+        if os.path.exists(candidate_path):
+            found_file = candidate_path
+            break
+
+    if found_file:
+        # If a 'pytorch_lora_weights.bin' is already there, remove it first
         if os.path.exists(lora_model_path):
             os.remove(lora_model_path)
-        os.rename(adapter_model_path, lora_model_path)
-        print(f"Renamed {adapter_model_path} -> {lora_model_path}")
+        os.rename(found_file, lora_model_path)
+        print(f"Renamed {found_file} -> {lora_model_path}")
     else:
-        # Just warn if no adapter_model.bin is found
-        print(f"No adapter_model.bin found in {folder}; skipping rename.")
+        print(f"No LoRA bin file found in {folder}; skipping rename.")
 
 
 # ------------------------------------------------------------------------------
@@ -267,7 +275,7 @@ def generate_synthetic_dermatofibroma(num_images=50):
     unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
 
-    # If unet_lora_path contains the correct 'pytorch_lora_weights.bin', we can load it
+    # If these directories exist, load the LoRA weights
     if os.path.isdir(unet_lora_path):
         pipe.unet.load_attn_procs(unet_lora_path)
     else:
