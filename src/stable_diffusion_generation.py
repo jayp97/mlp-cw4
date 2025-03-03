@@ -125,29 +125,20 @@ def inject_lora(unet, text_encoder, lora_rank=4):
             else unet.config.cross_attention_dim
         )
 
-        # Determine hidden size based on block type
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name.split(".")[1])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name.split(".")[1])
-            hidden_size = unet.config.block_out_channels[block_id]
-
+        # Remove 'hidden_size' from constructor call
         unet_lora_attn_procs[name] = attn_processor_cls(
-            hidden_size=hidden_size,
             cross_attention_dim=cross_attention_dim,
             rank=lora_rank,
         )
+
     unet.set_attn_processor(unet_lora_attn_procs)
 
     # Configure Text Encoder attention processors
     text_lora_attn_procs = {}
     for name, module in text_encoder.named_modules():
         if "attention.self" in name and "text_model.encoder.layers" in name:
+            # Remove 'hidden_size' from constructor call
             text_lora_attn_procs[name] = attn_processor_cls(
-                hidden_size=module.out_proj.in_features,
                 cross_attention_dim=None,
                 rank=lora_rank,
             )
