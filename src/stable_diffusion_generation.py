@@ -53,7 +53,6 @@ print(f"Using device: {DEVICE}")
 # ------------------------------------------------------------------------------
 def debug_file_paths():
     """Check that a sample image file exists at the specified path."""
-    # Adjust the image_dir based on where you run the script from:
     image_dir = "data/processed_sd/images/"
     sample_image = "ISIC_0025366.jpg"  # Change this if needed
     image_path = os.path.join(image_dir, sample_image)
@@ -135,19 +134,14 @@ def finetune_stable_diffusion_dermatofibroma():
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
     # 2) Apply LoRA to U-Net and text encoder
-    # Removed 'init_lora_weights' so it uses the library default
+    # We omit 'init_lora_weights' so the library default is used.
     lora_config_unet = LoraConfig(
         r=LORA_RANK,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
     lora_config_text = LoraConfig(
         r=LORA_RANK,
-        target_modules=[
-            "k_proj",
-            "q_proj",
-            "v_proj",
-            "out_proj",
-        ],  # CLIP text proj layers
+        target_modules=["k_proj", "q_proj", "v_proj", "out_proj"],
     )
 
     unet = get_peft_model(unet, lora_config_unet)
@@ -175,11 +169,10 @@ def finetune_stable_diffusion_dermatofibroma():
     global_step = 0
     unet.train()
     text_encoder.train()
-
     for epoch in range(EPOCHS):
         print(f"Starting epoch {epoch+1}/{EPOCHS}...")
         for images, prompts in tqdm(train_loader, desc="Training"):
-            # 1) Tokenize text
+            # Tokenize text
             input_ids = tokenizer(
                 prompts,
                 padding="max_length",
@@ -189,7 +182,7 @@ def finetune_stable_diffusion_dermatofibroma():
             ).input_ids.to(DEVICE)
             text_embeddings = text_encoder(input_ids)[0]
 
-            # 2) Convert images to latents
+            # Convert images to latents
             images_np = np.stack([np.array(img) for img in images])
             images_np = np.moveaxis(images_np, -1, 1)  # [B, 3, 512, 512]
             images_torch = torch.from_numpy(images_np).float().to(DEVICE) / 255.0
@@ -198,7 +191,7 @@ def finetune_stable_diffusion_dermatofibroma():
                 latents_dist = vae.encode(images_torch).latent_dist
                 latents = latents_dist.sample() * 0.18215
 
-            # 3) Add noise
+            # Add noise
             noise = torch.randn_like(latents)
             timesteps = torch.randint(
                 0,
@@ -208,13 +201,11 @@ def finetune_stable_diffusion_dermatofibroma():
             ).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # 4) Predict noise
+            # Predict noise
             noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
 
-            # 5) Compute loss (MSE)
+            # Compute loss (MSE)
             loss = torch.nn.functional.mse_loss(noise_pred, noise)
-
-            # 6) Backprop with gradient accumulation
             loss.backward()
             if (global_step + 1) % ACCUMULATION_STEPS == 0:
                 optimizer.step()
@@ -223,7 +214,6 @@ def finetune_stable_diffusion_dermatofibroma():
             global_step += 1
             if global_step >= TRAIN_STEPS:
                 break
-
         if global_step >= TRAIN_STEPS:
             break
 
@@ -231,6 +221,23 @@ def finetune_stable_diffusion_dermatofibroma():
     unet.save_pretrained(os.path.join(MODEL_SAVE_PATH, "unet_lora"))
     text_encoder.save_pretrained(os.path.join(MODEL_SAVE_PATH, "text_encoder_lora"))
     print("LoRA fine-tuning complete; weights saved.")
+
+
+# ------------------------------------------------------------------------------
+# Helper: Ensure expected LoRA weight file exists
+# ------------------------------------------------------------------------------
+def ensure_lora_weight_file(folder):
+    expected = os.path.join(folder, "pytorch_lora_weights.bin")
+    if not os.path.exists(expected):
+        # List any .bin files in the folder
+        bin_files = [f for f in os.listdir(folder) if f.endswith(".bin")]
+        if bin_files:
+            source = os.path.join(folder, bin_files[0])
+            shutil.copy(source, expected)
+            print(f"Copied {source} to {expected}")
+        else:
+            print(f"No .bin files found in {folder}")
+    return os.path.exists(expected)
 
 
 # ------------------------------------------------------------------------------
@@ -249,21 +256,11 @@ def generate_synthetic_dermatofibroma(num_images=50):
     unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
 
-    # For UNet, check if the expected file exists; if not, copy adapter_model.bin if present.
-    unet_expected = os.path.join(unet_lora_path, "pytorch_lora_weights.bin")
-    if not os.path.exists(unet_expected):
-        adapter_file = os.path.join(unet_lora_path, "adapter_model.bin")
-        if os.path.exists(adapter_file):
-            shutil.copy(adapter_file, unet_expected)
-            print(f"Copied {adapter_file} to {unet_expected}")
-
-    # Similarly, for the text encoder adapter weights (if needed)
-    text_expected = os.path.join(text_encoder_lora_path, "pytorch_lora_weights.bin")
-    if not os.path.exists(text_expected):
-        adapter_file = os.path.join(text_encoder_lora_path, "adapter_model.bin")
-        if os.path.exists(adapter_file):
-            shutil.copy(adapter_file, text_expected)
-            print(f"Copied {adapter_file} to {text_expected}")
+    # Ensure the expected weight files exist in the adapter directories
+    if not ensure_lora_weight_file(unet_lora_path):
+        print("Warning: Could not find or create UNet LoRA weight file.")
+    if not ensure_lora_weight_file(text_encoder_lora_path):
+        print("Warning: Could not find or create Text Encoder LoRA weight file.")
 
     if os.path.isdir(unet_lora_path) and os.path.isdir(text_encoder_lora_path):
         pipe.unet.load_attn_procs(unet_lora_path)
@@ -306,7 +303,6 @@ if __name__ == "__main__":
         "--debug", action="store_true", help="Run debug checks and exit."
     )
     args = parser.parse_args()
-
     if args.debug:
         print("Running debug checks...")
         debug_file_paths()
