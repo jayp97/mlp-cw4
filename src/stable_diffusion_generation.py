@@ -119,17 +119,9 @@ def inject_lora(unet, text_encoder, lora_rank=4):
     # Configure UNet attention processors
     unet_lora_attn_procs = {}
     for name in unet.attn_processors.keys():
-        cross_attention_dim = (
-            None
-            if name.endswith("attn1.processor")
-            else unet.config.cross_attention_dim
-        )
-
-        # Remove 'hidden_size' from constructor call
-        unet_lora_attn_procs[name] = attn_processor_cls(
-            cross_attention_dim=cross_attention_dim,
-            rank=lora_rank,
-        )
+        # Remove cross_attention_dim from constructor, as some older versions of
+        # LoRAAttnProcessor do not accept it.
+        unet_lora_attn_procs[name] = attn_processor_cls(rank=lora_rank)
 
     unet.set_attn_processor(unet_lora_attn_procs)
 
@@ -137,11 +129,8 @@ def inject_lora(unet, text_encoder, lora_rank=4):
     text_lora_attn_procs = {}
     for name, module in text_encoder.named_modules():
         if "attention.self" in name and "text_model.encoder.layers" in name:
-            # Remove 'hidden_size' from constructor call
-            text_lora_attn_procs[name] = attn_processor_cls(
-                cross_attention_dim=None,
-                rank=lora_rank,
-            )
+            text_lora_attn_procs[name] = attn_processor_cls(rank=lora_rank)
+
     for name, module in text_encoder.named_modules():
         if name in text_lora_attn_procs:
             module.processor = text_lora_attn_procs[name]
