@@ -4,7 +4,8 @@ Improvements Implemented:
 - Updated the training loop to use a persistent DataLoader iterator with loss logging.
 - Incorporated mixed precision training (AMP) when using CUDA.
 - Increased inference steps during generation for improved image quality.
-- Added comments suggesting further tuning (e.g., prompt refinement).
+- Fixed LoRA saving/loading mismatch by removing the file check for 'pytorch_lora_weights.bin' and using 'load_attn_procs' directly.
+- Replaced deprecated torch.cuda.amp usage with the new torch.amp syntax.
 """
 
 import os
@@ -185,11 +186,13 @@ def finetune_stable_diffusion_dermatofibroma():
     vae.to(DEVICE)
 
     # Setup mixed precision scaler if using CUDA
-    scaler = torch.cuda.amp.GradScaler() if DEVICE == "cuda" else None
+    # (Avoid future warnings by using torch.amp.GradScaler())
+    scaler = torch.amp.GradScaler() if DEVICE == "cuda" else None
 
     # D. Training Loop with persistent DataLoader iterator and loss logging
     unet.train()
     train_iter = iter(train_loader)
+
     for step in tqdm(range(TRAIN_STEPS), desc="Fine-tuning"):
         try:
             images, prompts = next(train_iter)
@@ -229,7 +232,8 @@ def finetune_stable_diffusion_dermatofibroma():
 
         # 5) Predict the noise using the LoRA-enabled UNet
         if DEVICE == "cuda":
-            with torch.cuda.amp.autocast():
+            # Use the new autocast signature
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                 noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
                 loss = torch.nn.functional.mse_loss(noise_pred, noise)
         else:
@@ -271,14 +275,13 @@ def generate_synthetic_dermatofibroma(num_images=50):
         safety_checker=None,  # Disable safety checker for medical images
     )
 
-    # B. Load the LoRA weights if available
-    lora_weights_file = os.path.join(MODEL_SAVE_PATH, "pytorch_lora_weights.bin")
-    if os.path.exists(lora_weights_file):
+    # B. Attempt to load the LoRA weights if present
+    try:
         pipe.unet.load_attn_procs(MODEL_SAVE_PATH)
         print("Loaded fine-tuned LoRA weights into the pipeline.")
-    else:
+    except Exception as e:
         print(
-            f"LoRA weights file not found in {MODEL_SAVE_PATH}. Using base model weights."
+            f"Failed to load LoRA weights from {MODEL_SAVE_PATH}. Using base model weights.\nError: {e}"
         )
 
     # Move pipeline to device
