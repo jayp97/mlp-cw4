@@ -16,6 +16,8 @@ mlp-cw4/
 │   │   └── HAM10000_metadata.csv      # Labels + metadata for HAM10000
 │   ├── processed/
 │   │   └── images/                    # Resized images (224x224, for example)
+│   ├── processed_sd/
+│   │   └── images/                    # Resized images (512x512)
 │   └── synthetic/
 │       └── images_dermatofibroma/     # Synthetic images generated
 │
