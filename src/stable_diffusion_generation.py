@@ -2,6 +2,7 @@ import os
 import torch
 import cv2
 import numpy as np
+import shutil
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
@@ -247,6 +248,23 @@ def generate_synthetic_dermatofibroma(num_images=50):
 
     unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
+
+    # For UNet, check if the expected file exists; if not, copy adapter_model.bin if present.
+    unet_expected = os.path.join(unet_lora_path, "pytorch_lora_weights.bin")
+    if not os.path.exists(unet_expected):
+        adapter_file = os.path.join(unet_lora_path, "adapter_model.bin")
+        if os.path.exists(adapter_file):
+            shutil.copy(adapter_file, unet_expected)
+            print(f"Copied {adapter_file} to {unet_expected}")
+
+    # Similarly, for the text encoder adapter weights (if needed)
+    text_expected = os.path.join(text_encoder_lora_path, "pytorch_lora_weights.bin")
+    if not os.path.exists(text_expected):
+        adapter_file = os.path.join(text_encoder_lora_path, "adapter_model.bin")
+        if os.path.exists(adapter_file):
+            shutil.copy(adapter_file, text_expected)
+            print(f"Copied {adapter_file} to {text_expected}")
+
     if os.path.isdir(unet_lora_path) and os.path.isdir(text_encoder_lora_path):
         pipe.unet.load_attn_procs(unet_lora_path)
         pipe.text_encoder.load_attn_procs(text_encoder_lora_path)
