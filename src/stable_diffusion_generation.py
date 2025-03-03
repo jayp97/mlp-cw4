@@ -4,8 +4,9 @@ Improvements Implemented:
 - Updated the training loop to use a persistent DataLoader iterator with loss logging.
 - Incorporated mixed precision training (AMP) when using CUDA.
 - Increased inference steps during generation for improved image quality.
-- Fixed LoRA saving/loading mismatch by removing the file check for 'pytorch_lora_weights.bin' and using 'load_attn_procs' directly.
+- Fixed LoRA saving/loading mismatch by loading the UNet LoRA weights from the "unet_lora" subdirectory.
 - Replaced deprecated torch.cuda.amp usage with the new torch.amp syntax.
+- Added a note for quick testing with fewer training steps.
 """
 
 import os
@@ -52,7 +53,9 @@ os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
-TRAIN_STEPS = 1000  # You may experiment with further increasing this number if needed.
+# For a quick test, you can set TRAIN_STEPS to 100. Then, if everything works as expected,
+# run with 1000 steps to overwrite the existing weights manually.
+TRAIN_STEPS = 100
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
 
@@ -275,13 +278,14 @@ def generate_synthetic_dermatofibroma(num_images=50):
         safety_checker=None,  # Disable safety checker for medical images
     )
 
-    # B. Attempt to load the LoRA weights if present
+    # B. Load the fine-tuned LoRA weights for UNet from the "unet_lora" subdirectory
+    lora_unet_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     try:
-        pipe.unet.load_attn_procs(MODEL_SAVE_PATH)
-        print("Loaded fine-tuned LoRA weights into the pipeline.")
+        pipe.unet.load_attn_procs(lora_unet_path)
+        print("Loaded fine-tuned LoRA weights into the pipeline from", lora_unet_path)
     except Exception as e:
         print(
-            f"Failed to load LoRA weights from {MODEL_SAVE_PATH}. Using base model weights.\nError: {e}"
+            f"Failed to load LoRA weights from {lora_unet_path}. Using base model weights.\nError: {e}"
         )
 
     # Move pipeline to device
