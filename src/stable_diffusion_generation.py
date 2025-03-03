@@ -59,6 +59,25 @@ print(f"Using device: {DEVICE}")
 
 
 # ------------------------------------------------------------------------------
+# Check if required data directories and files are accessible
+# ------------------------------------------------------------------------------
+def check_required_data():
+    """
+    Check if the necessary data directories and files are accessible before proceeding.
+    """
+    image_dir = "data/processed_sd/images/"
+    metadata_file = "data/raw/HAM10000_metadata.csv"
+    if not (os.path.isdir(image_dir) and os.access(image_dir, os.R_OK)):
+        raise FileNotFoundError(
+            f"Required directory '{image_dir}' does not exist or is not accessible."
+        )
+    if not (os.path.isfile(metadata_file) and os.access(metadata_file, os.R_OK)):
+        raise FileNotFoundError(
+            f"Required file '{metadata_file}' does not exist or is not accessible."
+        )
+
+
+# ------------------------------------------------------------------------------
 # Custom Collate Function
 # ------------------------------------------------------------------------------
 def custom_collate_fn(batch):
@@ -286,6 +305,7 @@ def main():
     """
     Main function to fine-tune Stable Diffusion with LoRA, then generate synthetic images.
     """
+    check_required_data()  # Ensure necessary data files and directories are accessible
     finetune_stable_diffusion_dermatofibroma()  # Step 1: Fine-tune
     generate_synthetic_dermatofibroma(num_images=50)  # Step 2: Generate images
 
