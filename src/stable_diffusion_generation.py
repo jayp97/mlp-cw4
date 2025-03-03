@@ -44,7 +44,7 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 # Training config
 # For a quick test, you can set TRAIN_STEPS to 100. Then, if everything works as expected,
 # run with 1000 steps to overwrite the existing weights manually.
-TRAIN_STEPS = 100
+TRAIN_STEPS = 1000
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
 
