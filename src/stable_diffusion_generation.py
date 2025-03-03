@@ -38,14 +38,39 @@ EPOCHS = 2  # Example: do multiple epochs
 
 IMAGE_SIZE = 512
 
-# Prompt
-# You could also incorporate a special token if you did a textual inversion approach (e.g., "<dermatofibroma>")
+# Prompt (you could include a special token if using textual inversion)
 PROMPT_TEMPLATE = (
     "Dermatofibroma lesion under dermoscopy, clinical photograph, high quality"
 )
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
+
+
+# ------------------------------------------------------------------------------
+# Debug Functions
+# ------------------------------------------------------------------------------
+def debug_file_paths():
+    """Check that a sample image file exists at the specified path."""
+    # Adjust the image_dir based on where you run the script from:
+    image_dir = "data/processed_sd/images/"
+    sample_image = "ISIC_0025366.jpg"  # Change this if needed
+    image_path = os.path.join(image_dir, sample_image)
+    if os.path.exists(image_path):
+        print(f"✅ File found: {image_path}")
+    else:
+        print(f"❌ File NOT found: {image_path}")
+
+
+def debug_metadata():
+    """Print metadata information to confirm filtering of dermatofibroma images."""
+    import pandas as pd
+
+    metadata_path = "data/raw/HAM10000_metadata.csv"
+    df_metadata = pd.read_csv(metadata_path)
+    df_filtered = df_metadata[df_metadata["dx"] == "df"]
+    print(f"✅ Found {len(df_filtered)} dermatofibroma images in metadata.")
+    print("Sample image IDs:", df_filtered["image_id"].head(10).tolist())
 
 
 # ------------------------------------------------------------------------------
@@ -108,7 +133,7 @@ def finetune_stable_diffusion_dermatofibroma():
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
-    # 2) (Optional) Apply LoRA to text encoder as well
+    # 2) Apply LoRA to U-Net and text encoder
     lora_config_unet = LoraConfig(
         r=LORA_RANK,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
@@ -125,7 +150,6 @@ def finetune_stable_diffusion_dermatofibroma():
         init_lora_weights="zeros",
     )
 
-    # Convert U-Net and text encoder to LoRA
     unet = get_peft_model(unet, lora_config_unet)
     text_encoder = get_peft_model(text_encoder, lora_config_text)
 
@@ -133,8 +157,7 @@ def finetune_stable_diffusion_dermatofibroma():
     text_encoder.to(DEVICE)
     vae.to(DEVICE)
 
-    # 3) Optimizer
-    # If you’re applying LoRA to text encoder + U-Net, pass both parameter sets
+    # 3) Optimizer (optimizing both U-Net and text encoder parameters)
     params_to_optimize = list(unet.parameters()) + list(text_encoder.parameters())
     optimizer = torch.optim.AdamW(params_to_optimize, lr=LR)
 
@@ -164,7 +187,6 @@ def finetune_stable_diffusion_dermatofibroma():
                 truncation=True,
                 return_tensors="pt",
             ).input_ids.to(DEVICE)
-
             text_embeddings = text_encoder(input_ids)[0]
 
             # 2) Convert images to latents
@@ -224,7 +246,6 @@ def generate_synthetic_dermatofibroma(num_images=50):
         safety_checker=None,
     ).to(DEVICE)
 
-    # If you have saved LoRA for both unet and text encoder:
     unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
     if os.path.isdir(unet_lora_path) and os.path.isdir(text_encoder_lora_path):
@@ -234,19 +255,13 @@ def generate_synthetic_dermatofibroma(num_images=50):
     else:
         print("Warning: No LoRA weights found. Using base model only.")
 
-    # Enable xformers if possible for speed
-    # try:
-    #     pipe.enable_xformers_memory_efficient_attention()
-    # except Exception:
-    #     pass
-
     pipe.enable_attention_slicing()
 
     for i in range(num_images):
         result = pipe(
             PROMPT_TEMPLATE,
-            num_inference_steps=100,  # More steps can help quality
-            guidance_scale=8.0,  # Stronger adherence to prompt
+            num_inference_steps=100,
+            guidance_scale=8.0,
             height=IMAGE_SIZE,
             width=IMAGE_SIZE,
         )
@@ -256,10 +271,28 @@ def generate_synthetic_dermatofibroma(num_images=50):
         print(f"Generated synthetic image: {save_path}")
 
 
+# ------------------------------------------------------------------------------
+# Main and Argument Parser
+# ------------------------------------------------------------------------------
 def main():
     finetune_stable_diffusion_dermatofibroma()
     generate_synthetic_dermatofibroma(num_images=50)
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Stable Diffusion Fine-tuning & Generation"
+    )
+    parser.add_argument(
+        "--debug", action="store_true", help="Run debug checks and exit."
+    )
+    args = parser.parse_args()
+
+    if args.debug:
+        print("Running debug checks...")
+        debug_file_paths()
+        debug_metadata()
+    else:
+        main()
