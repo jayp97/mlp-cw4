@@ -23,7 +23,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-HF_MODEL_ID = "runwayml/stable-diffusion-v1-5"  # Or your local/hub model
+HF_MODEL_ID = "runwayml/stable-diffusion-v1-5"  # Base Stable Diffusion
 SYNTHETIC_PATH = "data/synthetic/images_dermatofibroma/"
 MODEL_SAVE_PATH = "models/stable_diffusion_lora/"
 os.makedirs(SYNTHETIC_PATH, exist_ok=True)
@@ -32,14 +32,12 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 # Training config
 TRAIN_STEPS = 1000
 LORA_RANK = 4
-BATCH_SIZE = 2  # Use a slightly larger batch if possible
-ACCUMULATION_STEPS = 4  # Accumulate gradients
-LR = 1e-5  # Lower LR to reduce overfitting/noise
-EPOCHS = 2  # Example: do multiple epochs
+BATCH_SIZE = 2
+ACCUMULATION_STEPS = 4
+LR = 1e-5
+EPOCHS = 2  # Example: two epochs
 
 IMAGE_SIZE = 512
-
-# Prompt (you could include a special token if using textual inversion)
 PROMPT_TEMPLATE = (
     "Dermatofibroma lesion under dermoscopy, clinical photograph, high quality"
 )
@@ -54,7 +52,7 @@ print(f"Using device: {DEVICE}")
 def debug_file_paths():
     """Check that a sample image file exists at the specified path."""
     image_dir = "data/processed_sd/images/"
-    sample_image = "ISIC_0025366.jpg"  # Change this if needed
+    sample_image = "ISIC_0025366.jpg"
     image_path = os.path.join(image_dir, sample_image)
     if os.path.exists(image_path):
         print(f"✅ File found: {image_path}")
@@ -78,8 +76,7 @@ def debug_metadata():
 # ------------------------------------------------------------------------------
 class DermatofibromaDataset(Dataset):
     """
-    Loads dermatofibroma images from `data/processed_sd/images/` (HAM10000, preprocessed to 512x512)
-    and provides them along with a text prompt.
+    Loads 'df' (dermatofibroma) images from `data/processed_sd/images/`, each with a text prompt.
     """
 
     def __init__(
@@ -94,13 +91,14 @@ class DermatofibromaDataset(Dataset):
         self.image_dir = image_dir
         self.prompt = PROMPT_TEMPLATE
 
-        # Ensure that we actually have images in the directory
+        # Check if each row's corresponding image actually exists
         self.valid_rows = []
         for idx in range(len(self.df_metadata)):
             image_id = self.df_metadata.iloc[idx]["image_id"]
             image_path = os.path.join(self.image_dir, f"{image_id}.jpg")
             if os.path.exists(image_path):
                 self.valid_rows.append(idx)
+
         print(f"Found {len(self.valid_rows)} valid DF images for training.")
 
     def __len__(self):
@@ -124,17 +122,17 @@ def collate_fn(batch):
 # ------------------------------------------------------------------------------
 def finetune_stable_diffusion_dermatofibroma():
     """
-    Fine-tune Stable Diffusion on the dermatofibroma class using LoRA.
+    Fine-tune Stable Diffusion on the dermatofibroma class using LoRA via PEFT,
+    then rename the adapter file to 'pytorch_lora_weights.bin' so diffusers can load it later.
     """
-    # 1) Load models
+    # 1) Load base models
     unet = UNet2DConditionModel.from_pretrained(HF_MODEL_ID, subfolder="unet")
     text_encoder = CLIPTextModel.from_pretrained(HF_MODEL_ID, subfolder="text_encoder")
     vae = AutoencoderKL.from_pretrained(HF_MODEL_ID, subfolder="vae")
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
-    # 2) Apply LoRA to U-Net and text encoder
-    # We omit 'init_lora_weights' so the library default is used.
+    # 2) LoRA configs (no init_lora_weights => default)
     lora_config_unet = LoraConfig(
         r=LORA_RANK,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
@@ -144,6 +142,7 @@ def finetune_stable_diffusion_dermatofibroma():
         target_modules=["k_proj", "q_proj", "v_proj", "out_proj"],
     )
 
+    # Convert them to LoRA
     unet = get_peft_model(unet, lora_config_unet)
     text_encoder = get_peft_model(text_encoder, lora_config_text)
 
@@ -151,11 +150,11 @@ def finetune_stable_diffusion_dermatofibroma():
     text_encoder.to(DEVICE)
     vae.to(DEVICE)
 
-    # 3) Optimizer (optimizing both U-Net and text encoder parameters)
+    # 3) Optimizer
     params_to_optimize = list(unet.parameters()) + list(text_encoder.parameters())
     optimizer = torch.optim.AdamW(params_to_optimize, lr=LR)
 
-    # 4) Dataloader
+    # 4) Data
     dataset = DermatofibromaDataset()
     train_loader = DataLoader(
         dataset,
@@ -169,6 +168,7 @@ def finetune_stable_diffusion_dermatofibroma():
     global_step = 0
     unet.train()
     text_encoder.train()
+
     for epoch in range(EPOCHS):
         print(f"Starting epoch {epoch+1}/{EPOCHS}...")
         for images, prompts in tqdm(train_loader, desc="Training"):
@@ -184,7 +184,7 @@ def finetune_stable_diffusion_dermatofibroma():
 
             # Convert images to latents
             images_np = np.stack([np.array(img) for img in images])
-            images_np = np.moveaxis(images_np, -1, 1)  # [B, 3, 512, 512]
+            images_np = np.moveaxis(images_np, -1, 1)
             images_torch = torch.from_numpy(images_np).float().to(DEVICE) / 255.0
 
             with torch.no_grad():
@@ -197,16 +197,17 @@ def finetune_stable_diffusion_dermatofibroma():
                 0,
                 noise_scheduler.config.num_train_timesteps,
                 (latents.shape[0],),
-                device=latents.device,
+                device=DEVICE,
             ).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             # Predict noise
             noise_pred = unet(noisy_latents, timesteps, text_embeddings).sample
 
-            # Compute loss (MSE)
+            # Compute MSE loss
             loss = torch.nn.functional.mse_loss(noise_pred, noise)
             loss.backward()
+
             if (global_step + 1) % ACCUMULATION_STEPS == 0:
                 optimizer.step()
                 optimizer.zero_grad()
@@ -214,30 +215,39 @@ def finetune_stable_diffusion_dermatofibroma():
             global_step += 1
             if global_step >= TRAIN_STEPS:
                 break
+
         if global_step >= TRAIN_STEPS:
             break
 
-    # Save LoRA weights
-    unet.save_pretrained(os.path.join(MODEL_SAVE_PATH, "unet_lora"))
-    text_encoder.save_pretrained(os.path.join(MODEL_SAVE_PATH, "text_encoder_lora"))
+    # 6) Save LoRA weights
+    unet_dir = os.path.join(MODEL_SAVE_PATH, "unet_lora")
+    text_dir = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
+    unet.save_pretrained(unet_dir)
+    text_encoder.save_pretrained(text_dir)
     print("LoRA fine-tuning complete; weights saved.")
 
+    # 7) Rename 'adapter_model.bin' -> 'pytorch_lora_weights.bin' for each subfolder
+    rename_peft_adapter_to_lora(unet_dir)
+    rename_peft_adapter_to_lora(text_dir)
 
-# ------------------------------------------------------------------------------
-# Helper: Ensure expected LoRA weight file exists
-# ------------------------------------------------------------------------------
-def ensure_lora_weight_file(folder):
-    expected = os.path.join(folder, "pytorch_lora_weights.bin")
-    if not os.path.exists(expected):
-        # List any .bin files in the folder
-        bin_files = [f for f in os.listdir(folder) if f.endswith(".bin")]
-        if bin_files:
-            source = os.path.join(folder, bin_files[0])
-            shutil.copy(source, expected)
-            print(f"Copied {source} to {expected}")
-        else:
-            print(f"No .bin files found in {folder}")
-    return os.path.exists(expected)
+
+def rename_peft_adapter_to_lora(folder: str):
+    """
+    If 'adapter_model.bin' is found, rename/copy it to 'pytorch_lora_weights.bin'
+    so that diffusers can load it with `load_attn_procs()`.
+    """
+    adapter_model_path = os.path.join(folder, "adapter_model.bin")
+    lora_model_path = os.path.join(folder, "pytorch_lora_weights.bin")
+
+    if os.path.exists(adapter_model_path):
+        # If 'pytorch_lora_weights.bin' already exists, remove or rename it first
+        if os.path.exists(lora_model_path):
+            os.remove(lora_model_path)
+        os.rename(adapter_model_path, lora_model_path)
+        print(f"Renamed {adapter_model_path} -> {lora_model_path}")
+    else:
+        # Just warn if no adapter_model.bin is found
+        print(f"No adapter_model.bin found in {folder}; skipping rename.")
 
 
 # ------------------------------------------------------------------------------
@@ -245,7 +255,8 @@ def ensure_lora_weight_file(folder):
 # ------------------------------------------------------------------------------
 def generate_synthetic_dermatofibroma(num_images=50):
     """
-    Generate synthetic dermatofibroma images using the fine-tuned pipeline.
+    Load the fine-tuned LoRA pipeline from models/stable_diffusion_lora/
+    and generate synthetic images of dermatofibroma.
     """
     pipe = StableDiffusionPipeline.from_pretrained(
         HF_MODEL_ID,
@@ -256,18 +267,20 @@ def generate_synthetic_dermatofibroma(num_images=50):
     unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
     text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
 
-    # Ensure the expected weight files exist in the adapter directories
-    if not ensure_lora_weight_file(unet_lora_path):
-        print("Warning: Could not find or create UNet LoRA weight file.")
-    if not ensure_lora_weight_file(text_encoder_lora_path):
-        print("Warning: Could not find or create Text Encoder LoRA weight file.")
-
-    if os.path.isdir(unet_lora_path) and os.path.isdir(text_encoder_lora_path):
+    # If unet_lora_path contains the correct 'pytorch_lora_weights.bin', we can load it
+    if os.path.isdir(unet_lora_path):
         pipe.unet.load_attn_procs(unet_lora_path)
-        pipe.text_encoder.load_attn_procs(text_encoder_lora_path)
-        print("Loaded fine-tuned LoRA (UNet + Text Encoder).")
     else:
-        print("Warning: No LoRA weights found. Using base model only.")
+        print(f"Warning: {unet_lora_path} not found. Using base UNet weights.")
+
+    if os.path.isdir(text_encoder_lora_path):
+        pipe.text_encoder.load_attn_procs(text_encoder_lora_path)
+    else:
+        print(
+            f"Warning: {text_encoder_lora_path} not found. Using base text encoder weights."
+        )
+
+    print("Loaded fine-tuned LoRA (UNet + Text Encoder) if available.")
 
     pipe.enable_attention_slicing()
 
@@ -303,6 +316,7 @@ if __name__ == "__main__":
         "--debug", action="store_true", help="Run debug checks and exit."
     )
     args = parser.parse_args()
+
     if args.debug:
         print("Running debug checks...")
         debug_file_paths()
