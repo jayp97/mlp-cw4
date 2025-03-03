@@ -42,8 +42,6 @@ os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
-# For a quick test, you can set TRAIN_STEPS to 100. Then, if everything works as expected,
-# run with 1000 steps to overwrite the existing weights manually.
 TRAIN_STEPS = 100
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
@@ -52,7 +50,6 @@ BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
 IMAGE_SIZE = 512
 
 # Prompt used during training and generation.
-# Consider refining this prompt if the generated images do not match your fine-tuning examples.
 PROMPT_TEMPLATE = (
     "A dermatofibroma lesion, dermoscopy image, high quality clinical photograph"
 )
@@ -266,13 +263,28 @@ def generate_synthetic_dermatofibroma(num_images=50):
         use_safetensors=True,
     )
 
-    # B. Load the fine-tuned LoRA weights for UNet and text encoder.
+    # B. Load the fine-tuned LoRA weights into the UNet and text encoder separately.
     try:
-        pipe.load_lora_weights(MODEL_SAVE_PATH)
-        print("Loaded fine-tuned LoRA weights into the pipeline from", MODEL_SAVE_PATH)
+        unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
+        pipe.unet.load_lora_weights(unet_lora_path)
+        print("Loaded fine-tuned LoRA weights into UNet from", unet_lora_path)
     except Exception as e:
         print(
-            f"Failed to load LoRA weights from {MODEL_SAVE_PATH}. Using base model weights.\nError: {e}"
+            "Failed to load LoRA weights into UNet. Using base model weights.\nError:",
+            e,
+        )
+
+    try:
+        text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
+        pipe.text_encoder.load_lora_weights(text_encoder_lora_path)
+        print(
+            "Loaded fine-tuned LoRA weights into text encoder from",
+            text_encoder_lora_path,
+        )
+    except Exception as e:
+        print(
+            "Failed to load LoRA weights into text encoder. Using base model weights.\nError:",
+            e,
         )
 
     # Move pipeline to device
