@@ -137,7 +137,7 @@ def finetune_stable_diffusion_dermatofibroma():
     lora_config_unet = LoraConfig(
         r=LORA_RANK,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        init_lora_weights="zeros",
+        init_lora_weights="lora",  # Updated initialization setting
     )
     lora_config_text = LoraConfig(
         r=LORA_RANK,
@@ -147,7 +147,7 @@ def finetune_stable_diffusion_dermatofibroma():
             "v_proj",
             "out_proj",
         ],  # CLIP text proj layers
-        init_lora_weights="zeros",
+        init_lora_weights="lora",  # Updated initialization setting
     )
 
     unet = get_peft_model(unet, lora_config_unet)
