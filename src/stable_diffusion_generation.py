@@ -16,7 +16,7 @@ from diffusers import (
     AutoencoderKL,
 )
 from transformers import CLIPTextModel, CLIPTokenizer
-from diffusers.loaders import LoraLoaderMixin
+from safetensors.torch import load_file as safe_load_file
 
 
 # -------------------------------
@@ -42,6 +42,8 @@ os.makedirs(SYNTHETIC_PATH, exist_ok=True)
 os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
+# For a quick test, you can set TRAIN_STEPS to 100. Then, if everything works as expected,
+# run with 1000 steps to overwrite the existing weights manually.
 TRAIN_STEPS = 100
 LORA_RANK = 4  # Dimension controlling the size/effect of LoRA updates
 BATCH_SIZE = 1  # Batch size for fine-tuning; typically small for LoRA
@@ -129,6 +131,75 @@ class DermatofibromaDataset(Dataset):
 
 
 # ------------------------------------------------------------------------------
+# Helper: rename keys from the PEFT "base_model.model" prefix to match Diffusers
+# ------------------------------------------------------------------------------
+def rename_peft_unet_keys(state_dict):
+    """
+    PEFT saves LoRA weights under a 'base_model.model.*' prefix.
+    Diffusers expects the UNet's keys to start at e.g. 'down_blocks.0...'
+    without 'unet.' or 'base_model.model.'. This function strips the prefix.
+    """
+    new_sd = {}
+    for k, v in state_dict.items():
+        if k.startswith("base_model.model."):
+            new_key = k.replace("base_model.model.", "")
+        else:
+            new_key = k
+        new_sd[new_key] = v
+    return new_sd
+
+
+def rename_peft_text_encoder_keys(state_dict):
+    """
+    If you also trained LoRA on the text encoder with PEFT, you'd need
+    to strip the same prefix for text encoder layers.
+    (Your code currently doesn't train text encoder, so it may be unused.)
+    """
+    new_sd = {}
+    for k, v in state_dict.items():
+        if k.startswith("base_model.model."):
+            new_key = k.replace("base_model.model.", "")
+        else:
+            new_key = k
+        new_sd[new_key] = v
+    return new_sd
+
+
+def load_peft_lora_weights(pipe, lora_folder: str, device="cuda"):
+    """
+    Manually load LoRA weights from the PEFT-saved structure:
+      - unet_lora/adapter_model.safetensors
+      - text_encoder_lora/adapter_model.safetensors
+    Remaps the key prefixes and loads them into pipe.unet and pipe.text_encoder.
+    """
+    # UNet LoRA
+    unet_lora_path = os.path.join(lora_folder, "unet_lora", "adapter_model.safetensors")
+    if os.path.isfile(unet_lora_path):
+        unet_state_dict = safe_load_file(unet_lora_path, device="cpu")
+        unet_state_dict = rename_peft_unet_keys(unet_state_dict)
+        pipe.unet.load_state_dict(unet_state_dict, strict=False)
+        print(f"Loaded UNet LoRA weights from {unet_lora_path}")
+    else:
+        print(f"No UNet LoRA file found at {unet_lora_path}, using base UNet.")
+
+    # Text Encoder LoRA (only if you fine-tuned it)
+    text_enc_lora_path = os.path.join(
+        lora_folder, "text_encoder_lora", "adapter_model.safetensors"
+    )
+    if os.path.isfile(text_enc_lora_path):
+        text_enc_state_dict = safe_load_file(text_enc_lora_path, device="cpu")
+        text_enc_state_dict = rename_peft_text_encoder_keys(text_enc_state_dict)
+        pipe.text_encoder.load_state_dict(text_enc_state_dict, strict=False)
+        print(f"Loaded Text Encoder LoRA weights from {text_enc_lora_path}")
+    else:
+        print(
+            f"No Text Encoder LoRA file found at {text_enc_lora_path}, using base text encoder."
+        )
+
+    pipe.to(device)
+
+
+# ------------------------------------------------------------------------------
 # 2) Fine-Tuning with LoRA and Mixed Precision Training
 # ------------------------------------------------------------------------------
 def finetune_stable_diffusion_dermatofibroma():
@@ -156,7 +227,7 @@ def finetune_stable_diffusion_dermatofibroma():
             "to_q",
             "to_v",
             "to_out.0",
-        ],  # LoRA will be applied to these layers
+        ],  # LoRA will be applied to these attention sub-layers
         init_lora_weights="gaussian",  # Initialize LoRA weights with a Gaussian distribution
     )
     unet = get_peft_model(unet, lora_config)
@@ -242,6 +313,8 @@ def finetune_stable_diffusion_dermatofibroma():
             print(f"Step {step}, Loss: {loss.item()}")
 
     # E. Save LoRA weights
+    # This saves out a folder containing LoRA weights in "unet_lora/adapter_model.safetensors"
+    # plus the config, plus (optionally) text encoder LoRA if you also had trained that.
     unet.save_pretrained(MODEL_SAVE_PATH)
     print(f"Saved fine-tuned LoRA weights to {MODEL_SAVE_PATH}")
 
@@ -263,31 +336,12 @@ def generate_synthetic_dermatofibroma(num_images=50):
         use_safetensors=True,
     )
 
-    # B. Load the fine-tuned LoRA weights into the UNet and text encoder separately.
-    try:
-        unet_lora_path = os.path.join(MODEL_SAVE_PATH, "unet_lora")
-        pipe.unet.load_lora_weights(unet_lora_path)
-        print("Loaded fine-tuned LoRA weights into UNet from", unet_lora_path)
-    except Exception as e:
-        print(
-            "Failed to load LoRA weights into UNet. Using base model weights.\nError:",
-            e,
-        )
+    # B. Load the fine-tuned LoRA weights (remapped for Diffusers).
+    #    We do NOT call pipe.load_lora_weights(...) because that expects
+    #    a different naming convention. Instead, we manually rename and load.
+    load_peft_lora_weights(pipe, MODEL_SAVE_PATH, device=DEVICE)
 
-    try:
-        text_encoder_lora_path = os.path.join(MODEL_SAVE_PATH, "text_encoder_lora")
-        pipe.text_encoder.load_lora_weights(text_encoder_lora_path)
-        print(
-            "Loaded fine-tuned LoRA weights into text encoder from",
-            text_encoder_lora_path,
-        )
-    except Exception as e:
-        print(
-            "Failed to load LoRA weights into text encoder. Using base model weights.\nError:",
-            e,
-        )
-
-    # Move pipeline to device
+    # Move pipeline to device (in case it isn't already)
     pipe.to(DEVICE)
 
     # C. Generate images with increased inference steps for better quality
