@@ -28,7 +28,7 @@ os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
 
 # Training config
 TRAIN_STEPS = 1000
-LORA_RANK = 4
+LORA_RANK = 4  # Not used here because older LoRAAttnProcessor doesn't accept it
 BATCH_SIZE = 2
 ACCUMULATION_STEPS = 4
 LR = 1e-5
@@ -108,7 +108,13 @@ def collate_fn(batch):
 # ------------------------------------------------------------------------------
 # LoRA Implementation
 # ------------------------------------------------------------------------------
-def inject_lora(unet, text_encoder, lora_rank=4):
+def inject_lora(unet, text_encoder):
+    """
+    Inject LoRA into the UNet and Text Encoder.
+    Note: We do NOT pass 'rank' or 'cross_attention_dim', as the older
+          LoRAAttnProcessor version installed doesn't accept these.
+    """
+
     # Select appropriate processor class based on Torch version
     attn_processor_cls = (
         LoRAAttnProcessor2_0
@@ -119,9 +125,7 @@ def inject_lora(unet, text_encoder, lora_rank=4):
     # Configure UNet attention processors
     unet_lora_attn_procs = {}
     for name in unet.attn_processors.keys():
-        # Remove cross_attention_dim from constructor, as some older versions of
-        # LoRAAttnProcessor do not accept it.
-        unet_lora_attn_procs[name] = attn_processor_cls(rank=lora_rank)
+        unet_lora_attn_procs[name] = attn_processor_cls()
 
     unet.set_attn_processor(unet_lora_attn_procs)
 
@@ -129,7 +133,7 @@ def inject_lora(unet, text_encoder, lora_rank=4):
     text_lora_attn_procs = {}
     for name, module in text_encoder.named_modules():
         if "attention.self" in name and "text_model.encoder.layers" in name:
-            text_lora_attn_procs[name] = attn_processor_cls(rank=lora_rank)
+            text_lora_attn_procs[name] = attn_processor_cls()
 
     for name, module in text_encoder.named_modules():
         if name in text_lora_attn_procs:
@@ -144,8 +148,9 @@ def finetune_stable_diffusion_dermatofibroma():
     tokenizer = CLIPTokenizer.from_pretrained(HF_MODEL_ID, subfolder="tokenizer")
     noise_scheduler = DDPMScheduler.from_pretrained(HF_MODEL_ID, subfolder="scheduler")
 
-    # Inject LoRA
-    inject_lora(unet, text_encoder, LORA_RANK)
+    # Inject LoRA without 'rank'
+    inject_lora(unet, text_encoder)
+
     unet.to(DEVICE)
     text_encoder.to(DEVICE)
     vae.to(DEVICE)
