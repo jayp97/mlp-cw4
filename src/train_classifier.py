@@ -7,9 +7,22 @@ Trains a skin lesion classifier using real and/or synthetic images.
 The CSV file (for training and validation) contains metadata including image IDs and labels.
 Images are assumed to be stored together in a single folder and are named as {image_id}.jpg or .png.
 
-Optionally, you can filter by a given lesion code.
+If the optional --lesion_code is provided, only rows with that label will be used;
+otherwise, the entire dataset (all labels) is used.
 
-Example Usage:
+Example Usage (training on all labels):
+python train_classifier.py \
+  --train_csv="mlp-cw4/data/raw/HAM10000_metadata.csv" \
+  --val_csv="mlp-cw4/data/raw/HAM10000_metadata.csv" \
+  --image_dir="mlp-cw4/data/processed_sd/images" \
+  --label_column="dx" \
+  --batch_size=32 \
+  --epochs=20 \
+  --arch="vgg16" \
+  --lr=1e-3 \
+  --output_dir="mlp-cw4/models/final_classifier"
+
+Example Usage (training on one label only):
 python train_classifier.py \
   --train_csv="mlp-cw4/data/raw/HAM10000_metadata.csv" \
   --val_csv="mlp-cw4/data/raw/HAM10000_metadata.csv" \
@@ -66,7 +79,7 @@ def parse_args():
         "--lesion_code",
         type=str,
         default=None,
-        help="If provided, only use rows where the label equals this code.",
+        help="Optional: if provided, only use rows where the label equals this code.",
     )
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
