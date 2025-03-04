@@ -108,7 +108,8 @@ def custom_collate_fn(batch):
 class AllLesionDataset(Dataset):
     """
     Loads all HAM10000 images from 'data/processed_sd/images/' and incorporates
-    the full lesion label in the text prompt.
+    the full lesion label in the text prompt in the format:
+    (skin lesion, {full_label})
     """
 
     def __init__(
@@ -136,10 +137,8 @@ class AllLesionDataset(Dataset):
         image_path = os.path.join(self.image_dir, f"{image_id}.jpg")
         image = Image.open(image_path).convert("RGB")
 
-        # Incorporate the full label directly into the prompt
-        prompt = (
-            f"A {full_label} lesion, dermoscopy image, high quality clinical photograph"
-        )
+        # Use the paper's prompt format: (skin lesion, {full_label})
+        prompt = f"(skin lesion, {full_label})"
 
         return image, prompt
 
@@ -316,6 +315,9 @@ def finetune_stable_diffusion():
 def generate_synthetic_images(num_images=20):
     """
     Generate synthetic skin lesion images using the fine-tuned Stable Diffusion model.
+    The prompt used for generation follows the paper's format:
+    (skin lesion, {full_label})
+    Here we use Dermatofibroma as an example.
     """
     pipe = StableDiffusionPipeline.from_pretrained(
         HF_MODEL_ID,
@@ -329,7 +331,7 @@ def generate_synthetic_images(num_images=20):
 
     for i in range(num_images):
         result = pipe(
-            "A Dermatofibroma lesion, dermoscopy image, high quality clinical photograph",
+            "(skin lesion, Dermatofibroma)",
             num_inference_steps=150,
             guidance_scale=8.0,
             height=IMAGE_SIZE,
@@ -347,6 +349,8 @@ def generate_synthetic_images(num_images=20):
 def main():
     """
     Main function to fine-tune Stable Diffusion with LoRA, then generate synthetic images.
+    The prompt format for both training and generation is updated to:
+    (skin lesion, {full_label})
     """
     check_required_data()
     finetune_stable_diffusion()
