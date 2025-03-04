@@ -3,30 +3,34 @@
 """
 train_lora.py
 
-Second step: LoRA fine-tuning of Stable Diffusion for a single lesion concept.
-We load the textual embeddings from textual_inversion.py and then let LoRA
-layers in the U-Net "learn" to better depict this token in actual images.
+Fine-tunes Stable Diffusion with LoRA for a given lesion label.
+Images are selected by filtering a metadata CSV file for rows with the specified lesion code.
+The script loads the learned textual inversion embeddings (learned_embeds.safetensors)
+and then fine-tunes the UNet using LoRA so that the model better depicts the lesion token.
 
 Output:
-  - "pytorch_lora_weights.safetensors" in --output_dir
+  - pytorch_lora_weights.safetensors is saved in --output_dir
 
 Example Usage:
 python train_lora.py \
   --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
   --embed_path="mlp-cw4/models/txt_inversion_dermatofibroma/learned_embeds.safetensors" \
-  --train_data_dir="mlp-cw4/data/processed_sd/images/dermatofibroma" \
+  --metadata_file="mlp-cw4/data/raw/HAM10000_metadata.csv" \
+  --lesion_code="df" \
+  --train_data_dir="mlp-cw4/data/processed_sd/images" \
   --token="<derm_token>" \
-  --max_train_steps=1000 \
+  --resolution=512 \
   --learning_rate=1e-4 \
+  --max_train_steps=1000 \
   --rank=4 \
   --output_dir="mlp-cw4/models/stable_diffusion_lora"
 """
 import argparse
 import os
-import math
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
@@ -37,12 +41,11 @@ from diffusers import (
     DDPMScheduler,
     UNet2DConditionModel,
     LoraLoaderMixin,
-    StableDiffusionPipeline,
 )
 from diffusers.optimization import get_scheduler
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from transformers import CLIPTokenizer, CLIPTextModel
-from safetensors.torch import safe_open, save_file
+from safetensors.torch import save_file
 
 
 def parse_args():
@@ -52,19 +55,28 @@ def parse_args():
         "--embed_path",
         type=str,
         required=True,
-        help="learned_embeds.safetensors from textual_inversion.py",
+        help="Path to learned_embeds.safetensors from textual_inversion.py",
+    )
+    parser.add_argument(
+        "--metadata_file", type=str, required=True, help="Path to metadata CSV file"
+    )
+    parser.add_argument(
+        "--lesion_code",
+        type=str,
+        required=True,
+        help="Lesion code (e.g., 'df') to filter images",
     )
     parser.add_argument(
         "--train_data_dir",
         type=str,
         required=True,
-        help="Folder with 512×512 images for the same lesion concept.",
+        help="Directory containing all processed images",
     )
     parser.add_argument(
         "--token",
         type=str,
         required=True,
-        help="The placeholder token, e.g. <derm_token>",
+        help="The placeholder token (e.g., <derm_token>)",
     )
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=4)
@@ -76,24 +88,24 @@ def parse_args():
     return parser.parse_args()
 
 
-class SingleConceptDataset(Dataset):
+class FilteredLesionDataset(Dataset):
     """
-    We pair each image with a text prompt that includes <lesion_token>.
-    Example prompt: "An image of <derm_token>"
+    Dataset that filters images from a common folder using metadata for a given lesion code.
     """
 
-    def __init__(self, data_root, tokenizer, token="<derm_token>", resolution=512):
+    def __init__(
+        self, data_root, metadata_file, lesion_code, tokenizer, token, resolution=512
+    ):
         super().__init__()
+        self.data_root = data_root
+        self.metadata = pd.read_csv(metadata_file)
+        self.metadata = self.metadata[
+            self.metadata["dx"].str.lower() == lesion_code.lower()
+        ]
         self.tokenizer = tokenizer
         self.token = token
         self.resolution = resolution
-
-        self.image_paths = []
-        for fname in os.listdir(data_root):
-            if fname.lower().endswith((".png", ".jpg", ".jpeg")):
-                self.image_paths.append(os.path.join(data_root, fname))
-
-        self._length = len(self.image_paths)
+        self._length = len(self.metadata)
         self.prompt_text = f"An image of {self.token}"
         self.tokenized_text = self.tokenizer(
             self.prompt_text,
@@ -107,8 +119,10 @@ class SingleConceptDataset(Dataset):
         return self._length
 
     def __getitem__(self, idx):
-        path = self.image_paths[idx]
-        image = Image.open(path).convert("RGB")
+        row = self.metadata.iloc[idx]
+        image_id = row["image_id"]
+        image_path = os.path.join(self.data_root, f"{image_id}.jpg")
+        image = Image.open(image_path).convert("RGB")
         image = image.resize((self.resolution, self.resolution), Image.BICUBIC)
         image = np.array(image).astype(np.uint8)
         image = (image / 127.5 - 1.0).astype(np.float32)
@@ -121,36 +135,35 @@ def main():
     accelerator = Accelerator()
     set_seed(args.seed)
 
-    # 1) Load textual embeddings
+    # Load learned embeddings from textual inversion
     learned_embeds = {}
-    with safe_open(args.embed_path, framework="pt", device="cpu") as f:
-        for k in f.keys():
-            learned_embeds[k] = f.get_tensor(k)
+    from safetensors.torch import safe_open
 
-    # 2) Load base SD
+    with safe_open(args.embed_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            learned_embeds[key] = f.get_tensor(key)
+
+    # Load tokenizer and text encoder
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
+    # Add new token(s)
+    for token_name, embed in learned_embeds.items():
+        num_added = tokenizer.add_tokens(token_name)
+        text_encoder.resize_token_embeddings(len(tokenizer))
+        token_id = tokenizer.convert_tokens_to_ids(token_name)
+        with torch.no_grad():
+            text_encoder.get_input_embeddings().weight[token_id] = embed
+
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae"
     )
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet"
     )
-
-    # Insert your new token embedding
-    for token_name, embed in learned_embeds.items():
-        # add token to the tokenizer if not present
-        num_added = tokenizer.add_tokens(token_name)
-        text_encoder.resize_token_embeddings(len(tokenizer))
-        tid = tokenizer.convert_tokens_to_ids(token_name)
-        with torch.no_grad():
-            text_encoder.get_input_embeddings().weight[tid] = embed
-
-    # Freeze large modules
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False)
@@ -158,13 +171,14 @@ def main():
     unet.to(accelerator.device, dtype=torch.float16)
     text_encoder.to(accelerator.device, dtype=torch.float16)
 
-    # 3) Setup LoRA in unet
-    for name, attn_processor in unet.attn_processors.items():
+    # Replace UNet attention processors with LoRA versions
+    for name, _ in unet.attn_processors.items():
         unet.attn_processors[name] = LoRAAttnProcessor()
 
-    # 4) Dataset
-    dataset = SingleConceptDataset(
+    dataset = FilteredLesionDataset(
         data_root=args.train_data_dir,
+        metadata_file=args.metadata_file,
+        lesion_code=args.lesion_code,
         tokenizer=tokenizer,
         token=args.token,
         resolution=args.resolution,
@@ -173,21 +187,20 @@ def main():
         dataset, batch_size=args.train_batch_size, shuffle=True, drop_last=True
     )
 
-    # 5) Noise scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
 
-    # Trainable params
+    # Gather LoRA parameters from UNet attention processors
     lora_params = []
     for _, module in unet.attn_processors.items():
-        for pname, p in module.named_parameters():
+        for pname, param in module.named_parameters():
             if "lora_" in pname:
-                p.requires_grad = True
-                lora_params.append(p)
+                param.requires_grad = True
+                lora_params.append(param)
+    print(f"Found {len(lora_params)} LoRA parameters.")
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
-    num_update_steps_per_epoch = len(dataloader)
     max_train_steps = args.max_train_steps
     lr_scheduler = get_scheduler(
         "constant",
@@ -196,7 +209,6 @@ def main():
         num_training_steps=max_train_steps,
     )
 
-    # Accelerator
     unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, dataloader, lr_scheduler
     )
@@ -214,8 +226,6 @@ def main():
                 accelerator.device, dtype=torch.float32
             )
             input_ids = batch["input_ids"].to(accelerator.device)
-
-            # Convert images to latents
             latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
@@ -227,15 +237,10 @@ def main():
                 dtype=torch.long,
             )
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            # Text embeddings
             enc_out = text_encoder(input_ids=input_ids)
             encoder_hidden_states = enc_out[0].half()
-
-            # Predict
             noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-
             accelerator.backward(loss)
             optimizer.step()
             lr_scheduler.step()
@@ -247,16 +252,14 @@ def main():
         if global_step >= max_train_steps:
             break
 
-    # Save LoRA weights
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        # We'll gather unet's lora params
+        # Collect LoRA parameters from each attention processor
         lora_state_dict = {}
-        for name, attn_processor in unet.attn_processors.items():
-            for pname, param in attn_processor.named_parameters():
+        for name, module in unet.attn_processors.items():
+            for pname, param in module.named_parameters():
                 if "lora_" in pname:
                     lora_state_dict[f"{name}.{pname}"] = param.cpu()
-
         lora_path = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")
         save_file(lora_state_dict, lora_path)
         print(f"LoRA training done. Weights saved at {lora_path}")

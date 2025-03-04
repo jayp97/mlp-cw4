@@ -3,16 +3,18 @@
 """
 generate_synthetic_images.py
 
-Use your newly learned token and LoRA weights to generate synthetic images
-for the lesion. This script uses image-to-image (img2img) by default, since
-providing an existing real lesion image often yields better results.
+Generates synthetic skin lesion images for a given lesion label using the fine-tuned
+Stable Diffusion model (with LoRA) and the learned textual inversion embeddings.
+Images are selected by filtering a metadata CSV file.
 
 Example Usage:
 python generate_synthetic_images.py \
   --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
   --embed_path="mlp-cw4/models/txt_inversion_dermatofibroma/learned_embeds.safetensors" \
   --lora_weights="mlp-cw4/models/stable_diffusion_lora/pytorch_lora_weights.safetensors" \
-  --input_image_dir="mlp-cw4/data/processed_sd/images/dermatofibroma" \
+  --metadata_file="mlp-cw4/data/raw/HAM10000_metadata.csv" \
+  --lesion_code="df" \
+  --train_data_dir="mlp-cw4/data/processed_sd/images" \
   --output_dir="mlp-cw4/data/synthetic/images_dermatofibroma" \
   --token="<derm_token>" \
   --guidance_scale=7.5 \
@@ -28,6 +30,7 @@ from tqdm.auto import tqdm
 from diffusers import StableDiffusionImg2ImgPipeline
 from diffusers.loaders import LoraLoaderMixin
 from safetensors.torch import safe_open
+import pandas as pd
 
 
 def parse_args():
@@ -36,17 +39,23 @@ def parse_args():
     parser.add_argument("--embed_path", type=str, required=True)
     parser.add_argument("--lora_weights", type=str, required=True)
     parser.add_argument(
-        "--input_image_dir",
+        "--metadata_file", type=str, required=True, help="Path to metadata CSV file"
+    )
+    parser.add_argument(
+        "--lesion_code", type=str, required=True, help="Lesion code (e.g., 'df')"
+    )
+    parser.add_argument(
+        "--train_data_dir",
         type=str,
         required=True,
-        help="Directory with real 512×512 images to use as init images.",
+        help="Directory containing all processed images",
     )
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument(
         "--token",
         type=str,
         required=True,
-        help="The placeholder token you learned, e.g. <derm_token>.",
+        help="The placeholder token (e.g., <derm_token>)",
     )
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -60,6 +69,16 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Load metadata and filter for the given lesion code
+    metadata = pd.read_csv(args.metadata_file)
+    metadata = metadata[metadata["dx"].str.lower() == args.lesion_code.lower()]
+    image_ids = metadata["image_id"].tolist()
+    image_files = [
+        os.path.join(args.train_data_dir, f"{img_id}.jpg")
+        for img_id in image_ids
+        if os.path.exists(os.path.join(args.train_data_dir, f"{img_id}.jpg"))
+    ]
+
     # 1) Load pipeline
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -68,13 +87,12 @@ def main():
     )
     pipe = pipe.to(args.device)
 
-    # 2) Load textual inversion embeddings
+    # 2) Load learned embeddings and add token
     learned_embeds_dict = {}
     with safe_open(args.embed_path, framework="pt", device="cpu") as f:
         for key in f.keys():
             learned_embeds_dict[key] = f.get_tensor(key)
 
-    # Add token to pipeline
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
     for token_name, token_embed in learned_embeds_dict.items():
@@ -84,41 +102,33 @@ def main():
         with torch.no_grad():
             text_encoder.get_input_embeddings().weight[token_id] = token_embed
 
-    # 3) Load LoRA weights
+    # 3) Load LoRA weights into UNet
     LoraLoaderMixin.load_lora_into_unet(pipe.unet, args.lora_weights, alpha=1.0)
     pipe.unet.to(args.device, dtype=torch.float16)
 
-    # 4) For each image in input_image_dir, run img2img with your token
-    init_files = [
-        f
-        for f in os.listdir(args.input_image_dir)
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    ]
-    if not init_files:
-        print("No images found in input_image_dir.")
-        return
+    # 4) Generate synthetic images using img2img
+    for img_path in tqdm(image_files, desc="Generating"):
+        try:
+            init_image = (
+                Image.open(img_path).convert("RGB").resize((512, 512), Image.BICUBIC)
+            )
+        except Exception as e:
+            print(f"Error loading {img_path}: {e}")
+            continue
 
-    for fname in tqdm(init_files, desc="Generating"):
-        init_path = os.path.join(args.input_image_dir, fname)
-        init_image = (
-            Image.open(init_path).convert("RGB").resize((512, 512), Image.BICUBIC)
-        )
-
-        base_name = os.path.splitext(fname)[0]
-        # Example prompt
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
         prompt = f"An image of {args.token}"
         for i in range(args.num_images_per_prompt):
-            out = pipe(
+            result = pipe(
                 prompt=prompt,
                 image=init_image,
                 strength=args.strength,
                 guidance_scale=args.guidance_scale,
                 num_inference_steps=args.num_inference_steps,
             )
-            gen_image = out.images[0]
-            out_name = f"{base_name}_synthetic_{i}.png"
-            gen_image.save(os.path.join(args.output_dir, out_name))
-
+            gen_image = result.images[0]
+            out_fname = f"{base_name}_synthetic_{i}.png"
+            gen_image.save(os.path.join(args.output_dir, out_fname))
     print(f"All done! Synthetic images are in {args.output_dir}")
 
 
