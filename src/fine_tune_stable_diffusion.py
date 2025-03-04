@@ -38,6 +38,7 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 from safetensors.torch import save_file
 
@@ -103,7 +104,7 @@ class AllLesionDataset(Dataset):
         dx = row["dx"].lower()
         full_label = LABEL_MAP.get(dx, dx)
         prompt = f"(skin lesion, {full_label})"
-        # Tokenize prompt for use in conditioning.
+        # Tokenize prompt for conditioning.
         tokenized_text = self.tokenizer(
             prompt,
             padding="max_length",
@@ -132,8 +133,7 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
-    # (In this full-dataset fine-tuning we are not adding a new token.)
-    # Freeze the text encoder.
+    # We do not add any new token in full-dataset fine-tuning; we use the provided text encoder as-is.
     for param in text_encoder.parameters():
         param.requires_grad = False
 
@@ -150,17 +150,13 @@ def main():
     unet.to(accelerator.device, dtype=torch.float16)
     text_encoder.to(accelerator.device, dtype=torch.float16)
 
-    # Here we assume LoRA fine-tuning.
-    # We replace target modules in UNet with LoRA versions.
-    # (Assuming you have a LoRA configuration available in your diffusers installation.)
-    # For simplicity, here we assume that you call get_peft_model (if using PEFT) or manually replace attention processors.
-    # For our example, we simply replace each UNet attn processor with a LoRA-attention processor.
+    # Replace UNet attention processors with LoRA versions.
     from diffusers.models.attention_processor import LoRAAttnProcessor
 
     for name, _ in unet.attn_processors.items():
         unet.attn_processors[name] = LoRAAttnProcessor()
 
-    # Create the dataset that uses all images and auto-generates prompts.
+    # Create dataset and dataloader.
     dataset = AllLesionDataset(
         data_root=args.train_data_dir,
         metadata_file=args.metadata_file,
@@ -174,8 +170,7 @@ def main():
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
-    # Fine-tuning: we update the LoRA parameters in the UNet only.
-    # Gather LoRA parameters.
+    # Gather LoRA parameters (only those in UNet attn processors).
     lora_params = []
     for _, module in unet.attn_processors.items():
         for pname, param in module.named_parameters():
@@ -237,7 +232,7 @@ def main():
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        # Save the fine-tuned UNet with LoRA adapters.
+        # Save the fine-tuned UNet (with LoRA adapters).
         unet.save_pretrained(args.output_dir)
         print(f"Saved fine-tuned LoRA weights to {args.output_dir}")
 
