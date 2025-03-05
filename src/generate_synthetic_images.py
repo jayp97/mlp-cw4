@@ -26,7 +26,6 @@ import os
 import torch
 import json
 from diffusers import StableDiffusionPipeline, DDIMScheduler
-from diffusers.models.attention_processor import AttnProcessor
 from tqdm.auto import tqdm
 from PIL import Image
 
@@ -92,153 +91,84 @@ def parse_args():
     return parser.parse_args()
 
 
-class CustomLoRAAttnProcessor(AttnProcessor):
-    """Custom LoRA attention processor that directly applies pre-loaded weights."""
+def inject_lora_into_unet(unet, lora_weights, scale=1.0):
+    """
+    Directly inject LoRA weights into UNet model by modifying forward methods.
+    This approach bypasses the need for specific attention processor modules.
+    """
+    print(f"Applying LoRA weights with scale {scale}...")
 
-    def __init__(
-        self,
-        hidden_size,
-        cross_attention_dim=None,
-        rank=4,
-        module_name="",
-        lora_weights=None,
-    ):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.cross_attention_dim = (
-            cross_attention_dim if cross_attention_dim is not None else hidden_size
-        )
-        self.rank = rank
-        self.module_name = module_name
-        self.lora_weights = lora_weights
-        self.scale = 1.0
+    # Parse module name format from the LoRA weights
+    modules_to_modify = {}
+    for key in lora_weights:
+        parts = key.split("|")
+        if len(parts) != 2:
+            continue
 
-        # Get the relevant parameters for this module from the LoRA weights
-        if lora_weights is not None:
-            # Look for keys that match this module
-            for key in lora_weights:
-                if self.module_name in key and "|up." in key:
-                    self.up_weight = lora_weights[key]
-                elif self.module_name in key and "|down." in key:
-                    self.down_weight = lora_weights[key]
+        module_name = parts[0]
+        param_name = parts[1]
 
-    def __call__(
-        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None
-    ):
-        batch_size, sequence_length, _ = hidden_states.shape
-        attention_mask = attn.prepare_attention_mask(
-            attention_mask, sequence_length, batch_size
-        )
+        if module_name not in modules_to_modify:
+            modules_to_modify[module_name] = {}
 
-        query = attn.to_q(hidden_states)
+        modules_to_modify[module_name][param_name] = lora_weights[key]
 
-        is_cross = encoder_hidden_states is not None
-        encoder_hidden_states = encoder_hidden_states if is_cross else hidden_states
+    print(f"Found {len(modules_to_modify)} modules to modify")
 
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+    # Modify each module with LoRA weights
+    modules_modified = 0
+    for module_path, module_weights in modules_to_modify.items():
+        # Get the module from the UNet
+        module = unet
+        for name in module_path.split("."):
+            if not hasattr(module, name):
+                print(f"Warning: Could not find module at path {module_path}")
+                break
+            module = getattr(module, name)
+        else:
+            # Successfully accessed the module, now modify its forward method
+            if "up" in module_weights and "down" in module_weights:
+                # Get original forward method
+                orig_forward = module.forward
 
-        # Apply LoRA attention if we have the weights
-        if hasattr(self, "up_weight") and hasattr(self, "down_weight"):
-            # Reshape for down projection
-            down_hidden_states = hidden_states.reshape(
-                hidden_states.shape[0], hidden_states.shape[1], -1
-            )
-            # Apply down projection
-            down_proj = torch.matmul(
-                down_hidden_states, self.down_weight.t().to(hidden_states.device)
-            )
-            # Apply up projection
-            up_proj = torch.matmul(
-                down_proj, self.up_weight.t().to(hidden_states.device)
-            )
-            # Reshape to match original shape
-            lora_output = up_proj.reshape(hidden_states.shape) * self.scale
-            # Add LoRA output to query
-            query = query + lora_output
+                # Apply LoRA weights through a new forward method
+                def make_lora_forward(orig_func, up_weight, down_weight, scale):
+                    def lora_forward(x, *args, **kwargs):
+                        # Call original forward
+                        result = orig_func(x, *args, **kwargs)
 
-        query = attn.head_to_batch_dim(query)
-        key = attn.head_to_batch_dim(key)
-        value = attn.head_to_batch_dim(value)
+                        # Apply LoRA: (x @ down_weight.T) @ up_weight.T
+                        # First reshape x for matrix multiplication
+                        x_reshaped = x.reshape(-1, x.shape[-1])
 
-        # the output of sdp = (batch, num_heads, seq_len, head_dim)
-        hidden_states = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0
-        )
-        hidden_states = attn.batch_to_head_dim(hidden_states)
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
+                        # Apply down projection
+                        down_projection = torch.matmul(
+                            x_reshaped, down_weight.t().to(x.device)
+                        )
 
-        return hidden_states
+                        # Apply up projection
+                        up_projection = torch.matmul(
+                            down_projection, up_weight.t().to(x.device)
+                        )
 
+                        # Reshape back to original shape and scale
+                        lora_output = up_projection.reshape(result.shape) * scale
 
-def apply_lora(unet, lora_path, scale=1.0):
-    """Apply LoRA weights to the UNet model."""
-    print(f"Loading LoRA weights from {lora_path}...")
+                        # Add LoRA output to the original output
+                        return result + lora_output
 
-    if lora_path.endswith(".bin"):
-        # Load PyTorch weights directly
-        lora_state_dict = torch.load(lora_path, map_location="cpu")
-    elif lora_path.endswith(".safetensors"):
-        try:
-            from safetensors.torch import load_file
+                    return lora_forward
 
-            lora_state_dict = load_file(lora_path)
-        except:
-            print("Failed to load safetensors, falling back to PyTorch format")
-            lora_state_dict = torch.load(
-                lora_path.replace(".safetensors", ".bin"), map_location="cpu"
-            )
-    else:
-        raise ValueError(f"Unsupported weight file format: {lora_path}")
+                # Replace the forward method
+                up_weight = module_weights["up.weight"]
+                down_weight = module_weights["down.weight"]
+                module.forward = make_lora_forward(
+                    orig_forward, up_weight, down_weight, scale
+                )
+                modules_modified += 1
 
-    print(f"Loaded {len(lora_state_dict)} LoRA parameter entries")
-
-    # Look for adapter_config.json in the same directory
-    config_path = os.path.join(os.path.dirname(lora_path), "adapter_config.json")
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            adapter_config = json.load(f)
-            rank = adapter_config.get("lora_rank", 4)
-            print(f"Using rank {rank} from adapter config")
-    else:
-        # Default rank
-        rank = 4
-
-    # Apply LoRA weights to each attention module
-    lora_attn_procs = {}
-
-    for name, module in unet.named_modules():
-        if "attn1" in name or "attn2" in name:
-            if name.endswith("processor"):
-                continue
-
-            # Configure correct hidden sizes
-            if "attn1" in name:  # self-attention
-                hidden_size = module.to_q.in_features
-                cross_attention_dim = None
-            else:  # cross-attention
-                hidden_size = module.to_q.in_features
-                cross_attention_dim = module.to_k.in_features
-
-            # Create custom processor with LoRA weights
-            lora_processor = CustomLoRAAttnProcessor(
-                hidden_size=hidden_size,
-                cross_attention_dim=cross_attention_dim,
-                rank=rank,
-                module_name=name,
-                lora_weights=lora_state_dict,
-            )
-            lora_processor.scale = scale
-
-            # Store for later application
-            lora_attn_procs[name] = lora_processor
-
-    # Apply all processors at once
-    unet.set_attn_processor(lora_attn_procs)
-    print(f"Applied {len(lora_attn_procs)} LoRA attention processors")
-
-    return unet
+    print(f"Successfully modified {modules_modified} modules")
+    return modules_modified > 0
 
 
 def main():
@@ -264,9 +194,32 @@ def main():
     # Use DDIM scheduler for better quality
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
 
-    # 2) Apply LoRA weights
+    # 2) Load and apply LoRA weights
     if os.path.exists(args.lora_weights):
-        apply_lora(pipe.unet, args.lora_weights, scale=args.lora_scale)
+        print(f"Loading LoRA weights from {args.lora_weights}...")
+        try:
+            lora_state_dict = torch.load(args.lora_weights, map_location="cpu")
+            print(f"Loaded {len(lora_state_dict)} LoRA parameter entries")
+
+            # Look for adapter_config.json in the same directory
+            config_path = os.path.join(
+                os.path.dirname(args.lora_weights), "adapter_config.json"
+            )
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    adapter_config = json.load(f)
+                    print(f"Loaded adapter config: {adapter_config}")
+
+            # Apply LoRA weights by directly modifying modules
+            success = inject_lora_into_unet(
+                pipe.unet, lora_state_dict, scale=args.lora_scale
+            )
+            if not success:
+                print("WARNING: Failed to apply LoRA weights correctly")
+                print("Continuing with base model only")
+        except Exception as e:
+            print(f"Error applying LoRA weights: {e}")
+            print("Continuing with base model only")
     else:
         print(f"WARNING: LoRA weights not found at {args.lora_weights}")
         print("Proceeding with base model only. Results will not have the fine-tuning!")
