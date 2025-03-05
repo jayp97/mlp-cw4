@@ -78,8 +78,30 @@ def end_to_end_pipeline(
         logger.error(f"Failed to prepare data for class '{display_class_name}'")
         return
 
-    # Remaining function stays the same, but we pass dataset_class_code to the training function
-    # and display_class_name to the generation function with mapping...
+    # Step 2: Fine-tune the model
+    logger.info(f"Step 2: Fine-tuning the model for class '{specific_class}'")
+    model_path = train_lora(
+        model_id=model_id,
+        train_data_dir=data_dir,
+        class_name=specific_class,
+        output_dir=model_dir,
+        num_epochs=num_epochs,
+    )
+
+    # Step 3: Generate synthetic images
+    logger.info(
+        f"Step 3: Generating {num_images} synthetic images for class '{specific_class}'"
+    )
+    output_path = generate_images(
+        model_id=model_id,
+        lora_model_path=model_path,
+        class_name=specific_class,
+        num_images=num_images,
+        output_dir=synthetic_dir,
+    )
+
+    logger.info(f"Pipeline completed! Generated images saved to: {output_path}")
+    return output_path
 
 
 if __name__ == "__main__":
