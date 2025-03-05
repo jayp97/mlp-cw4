@@ -4,8 +4,6 @@ This project tests the hypothesis:
 
 > _By synthetically generating images for the dermatofibroma class (using fine-tuned Stable Diffusion / FLUX), we can overbalance that class in the HAM10000 dataset and improve classification accuracy in an EfficientNetV2 model._
 
-We also measure how different real-to-synthetic ratios (e.g. 1:0, 1:0.5, 1:1, 1:1.5, 1:2) affect classification performance.
-
 ## Project Structure
 
 ```
@@ -30,6 +28,8 @@ mlp-cw4/
 │   ├── data_preprocessing.py          # Resizing + metadata loading
 │   ├── stable_diffusion_generation.py # Synthetic generation (fine-tuned SD / FLUX)
 │   ├── classification.py              # EfficientNetV2 training/fine-tuning
+│   ├── finetune_stable_diffusion.py   # fine-tuning stable diffusion
+│   ├── generate_synthetic_images.py   # generating synthetic images
 │   ├── evaluation.py                  # Model evaluation
 │   └── utils.py                       # (Optional) helper code
 │

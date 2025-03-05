@@ -22,7 +22,7 @@ Requirements:
 ----------------------------------------
 
 Example Usage:
-  python finetune_stable_diffusion.py \
+  python src/finetune_stable_diffusion.py \
     --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
     --metadata_file="data/raw/HAM10000_metadata.csv" \
     --train_data_dir="data/processed_sd/images" \
