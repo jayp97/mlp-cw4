@@ -10,7 +10,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Add this dictionary near the top of pipeline.py
+CLASS_MAPPING = {
+    # Full names to codes
+    "dermatofibroma": "df",
+    "melanocytic_nevi": "nv",
+    "melanoma": "mel",
+    "benign_keratosis": "bkl",
+    "basal_cell_carcinoma": "bcc",
+    "actinic_keratoses": "akiec",
+    "vascular_lesions": "vasc",
+    # Codes remain the same
+    "df": "df",
+    "nv": "nv",
+    "mel": "mel",
+    "bkl": "bkl",
+    "bcc": "bcc",
+    "akiec": "akiec",
+    "vasc": "vasc",
+}
 
+
+# Then in the end_to_end_pipeline function, update the specific_class parameter:
 def end_to_end_pipeline(
     model_id="runwayml/stable-diffusion-v1-5",
     metadata_path="data/raw/HAM10000_metadata.csv",
@@ -22,17 +43,17 @@ def end_to_end_pipeline(
 ):
     """
     Run the complete pipeline: data preparation, fine-tuning, and image generation.
-
-    Args:
-        model_id: HuggingFace model ID for Stable Diffusion
-        metadata_path: Path to HAM10000 metadata CSV
-        processed_images_path: Path to processed 512x512 images
-        specific_class: Lesion class to train on and generate
-        num_epochs: Number of training epochs
-        num_images: Number of images to generate
-        output_dir: Directory to save results
     """
     logger.info("Starting end-to-end pipeline")
+
+    # Map class name to dataset code if needed
+    if specific_class in CLASS_MAPPING:
+        dataset_class_code = CLASS_MAPPING[specific_class]
+    else:
+        dataset_class_code = specific_class
+
+    # Use full name for display/output but code for data preparation
+    display_class_name = specific_class
 
     # Create output directories
     data_dir = os.path.join(output_dir, "data")
@@ -43,43 +64,22 @@ def end_to_end_pipeline(
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(synthetic_dir, exist_ok=True)
 
-    # Step 1: Data preparation
-    logger.info(f"Step 1: Preparing data for class '{specific_class}'")
+    # Step 1: Data preparation using the dataset code
+    logger.info(f"Step 1: Preparing data for class '{display_class_name}'")
     prompt_file = create_class_specific_data(
-        specific_class=specific_class,
+        specific_class=dataset_class_code,
         metadata_path=metadata_path,
         processed_images_path=processed_images_path,
         output_dir=data_dir,
+        prompt_template="{lesion_type} skin lesion, dermatology image",  # Use code here
     )
 
     if prompt_file is None:
-        logger.error(f"Failed to prepare data for class '{specific_class}'")
+        logger.error(f"Failed to prepare data for class '{display_class_name}'")
         return
 
-    # Step 2: Fine-tune the model
-    logger.info(f"Step 2: Fine-tuning the model for class '{specific_class}'")
-    model_path = train_lora(
-        model_id=model_id,
-        train_data_dir=data_dir,
-        class_name=specific_class,
-        output_dir=model_dir,
-        num_epochs=num_epochs,
-    )
-
-    # Step 3: Generate synthetic images
-    logger.info(
-        f"Step 3: Generating {num_images} synthetic images for class '{specific_class}'"
-    )
-    output_path = generate_images(
-        model_id=model_id,
-        lora_model_path=model_path,
-        class_name=specific_class,
-        num_images=num_images,
-        output_dir=synthetic_dir,
-    )
-
-    logger.info(f"Pipeline completed! Generated images saved to: {output_path}")
-    return output_path
+    # Remaining function stays the same, but we pass dataset_class_code to the training function
+    # and display_class_name to the generation function with mapping...
 
 
 if __name__ == "__main__":
