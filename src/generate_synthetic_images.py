@@ -138,10 +138,16 @@ def main():
     ).to(args.device)
 
     # 2) Load fine-tuned LoRA weights if provided.
-    # The expected signature is load_lora_into_unet(unet, state_dict_or_path)
     if args.lora_weights and os.path.exists(args.lora_weights):
         try:
-            LoraLoaderMixin.load_lora_into_unet(pipe.unet, args.lora_weights)
+            # Retrieve the state_dict and alphas
+            state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(
+                args.lora_weights
+            )
+            # Load them into the unet
+            LoraLoaderMixin.load_lora_into_unet(
+                state_dict=state_dict, network_alphas=network_alphas, unet=pipe.unet
+            )
             print(f"Loaded LoRA weights from {args.lora_weights}")
         except Exception as e:
             print(f"Error loading LoRA weights: {e}")
