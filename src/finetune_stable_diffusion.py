@@ -38,7 +38,7 @@ from tqdm import tqdm
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from diffusers.optimization import get_scheduler
+from diffusers.optimization import get_scheduler  # Import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 from safetensors.torch import save_file
 
@@ -133,7 +133,7 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
-    # We do not add any new token in full-dataset fine-tuning; we use the provided text encoder as-is.
+    # In full-dataset fine-tuning we do not add any new token; use the provided text encoder.
     for param in text_encoder.parameters():
         param.requires_grad = False
 
@@ -153,7 +153,7 @@ def main():
     # Replace UNet attention processors with LoRA versions.
     from diffusers.models.attention_processor import LoRAAttnProcessor
 
-    for name, _ in unet.attn_processors.items():
+    for name, module in unet.attn_processors.items():
         unet.attn_processors[name] = LoRAAttnProcessor()
 
     # Create dataset and dataloader.
@@ -170,11 +170,17 @@ def main():
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
-    # Gather LoRA parameters (only those in UNet attn processors).
+    # Gather LoRA parameters from UNet attn processors.
     lora_params = []
-    for _, module in unet.attn_processors.items():
-        for pname, param in module.named_parameters():
-            if "lora_" in pname:
+    for name, module in unet.attn_processors.items():
+        # Some processors (e.g., AttnProcessor2_0) may not implement named_parameters.
+        if hasattr(module, "named_parameters"):
+            for pname, param in module.named_parameters():
+                if "lora_" in pname:
+                    param.requires_grad = True
+                    lora_params.append(param)
+        else:
+            for param in module.parameters():
                 param.requires_grad = True
                 lora_params.append(param)
     print(f"Found {len(lora_params)} LoRA parameters to train.")
@@ -232,7 +238,7 @@ def main():
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        # Save the fine-tuned UNet (with LoRA adapters).
+        # Save the fine-tuned UNet with LoRA adapters.
         unet.save_pretrained(args.output_dir)
         print(f"Saved fine-tuned LoRA weights to {args.output_dir}")
 
