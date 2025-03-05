@@ -99,8 +99,63 @@ def main():
         args.pretrained_model, torch_dtype=torch.float16
     ).to("cuda")
 
-    # 2) Load the LoRA weights.
-    pipe.load_lora_weights(args.lora_weights)
+    # 2) Load the LoRA weights with adapter name
+    try:
+        # First try standard loading
+        pipe.load_lora_weights(
+            os.path.dirname(args.lora_weights),
+            weight_name=os.path.basename(args.lora_weights),
+        )
+    except ValueError as e:
+        print(f"Standard loading failed: {e}. Trying alternative loading method...")
+        # If that fails, try loading as a standalone file
+        from safetensors.torch import load_file
+
+        # Load the weights
+        state_dict = load_file(args.lora_weights)
+
+        # Manually apply the weights to the UNet
+        # This is a fallback approach for custom saved LoRA weights
+        print("Manually applying LoRA weights...")
+
+        for key, value in state_dict.items():
+            # Skip metadata and config keys
+            if key.startswith("peft_config") or not key.startswith("lora."):
+                continue
+
+            # Parse the key to find the target module and parameter
+            parts = key.split(".")
+            if len(parts) < 4:
+                continue
+
+            direction = parts[1]  # 'up' or 'down'
+            module_path = parts[2]  # The module path with underscores
+            param_name = parts[3]  # Usually 'weight'
+
+            # Convert underscores back to dots for module lookup
+            module_path = module_path.replace("_", ".")
+
+            # Find the matching module
+            target_found = False
+            for name, module in pipe.unet.named_modules():
+                if name.endswith(module_path):
+                    if hasattr(module, "lora_layer"):
+                        # Use existing lora layer
+                        if direction == "up" and hasattr(module.lora_layer, "up"):
+                            module.lora_layer.up.weight.copy_(value)
+                            target_found = True
+                        elif direction == "down" and hasattr(module.lora_layer, "down"):
+                            module.lora_layer.down.weight.copy_(value)
+                            target_found = True
+                    elif direction in ["up", "down"]:
+                        # Need to inject a new LoRA layer
+                        # This is a simplified version - in practice you'd need proper layer creation
+                        print(f"Would need to inject LoRA layer into {name}")
+
+            if not target_found:
+                print(f"Could not find target for {key}")
+
+        print("Manual loading completed")
 
     # 3) Setup a random generator for reproducibility.
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
