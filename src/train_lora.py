@@ -11,7 +11,7 @@ layers are updated while the rest of the model remains frozen.
 
 Example usage:
 ---------------
-accelerate launch --mixed_precision=fp16 src/train_lora.py \
+accelerate launch src/train_lora.py \
   --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
   --metadata_file="data/raw/HAM10000_metadata.csv" \
   --train_data_dir="data/processed_sd/images" \
@@ -183,7 +183,7 @@ def main():
     logger.info(args)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision="no",  # Changed from auto (default) to "no" to avoid type mismatches
+        mixed_precision="no",  # Changed to "no" to avoid type mismatches
     )
     set_seed(args.seed)
 
@@ -267,7 +267,6 @@ def main():
 
     # 9) Move VAE and text_encoder to device.
     device = accelerator.device
-    # Don't force float16 for these models
     vae.to(device)
     text_encoder.to(device)
 
@@ -288,7 +287,6 @@ def main():
         with accelerator.accumulate(unet):
             # i) Convert images to latents using VAE.
             with torch.no_grad():
-                # Keep in full precision
                 latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
 
             # ii) Sample noise and timesteps.
@@ -340,83 +338,65 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         unwrapped_unet = accelerator.unwrap_model(unet)
 
-        # Create a dict for actual tensor weights
+        # Save weights directly as standard PyTorch format
+        torch_path = os.path.join(args.output_dir, "pytorch_lora_weights.bin")
+
+        # First, extract all the LoRA parameters in a structured format
         lora_state_dict = {}
 
-        # Add the LoRA weights
         for name, module in unwrapped_unet.named_modules():
             if hasattr(module, "lora_layer"):
-                # We need the correct format for cross attention layers
-                if "to_q" in name:
-                    layer_type = "q_proj"
-                elif "to_k" in name:
-                    layer_type = "k_proj"
-                elif "to_v" in name:
-                    layer_type = "v_proj"
-                elif "to_out.0" in name:
-                    layer_type = "out_proj"
-                else:
-                    continue
+                # Store original module name and parameter name
+                module_name = name
+                for p_name, p_val in module.lora_layer.state_dict().items():
+                    key = f"{module_name}|{p_name}"
+                    lora_state_dict[key] = p_val.cpu()
 
-                # Get the LoRA up and down weights
-                up_weight = module.lora_layer.up.weight.data.cpu()
-                down_weight = module.lora_layer.down.weight.data.cpu()
+        # Save as PyTorch bin file
+        torch.save(lora_state_dict, torch_path)
+        logger.info(f"LoRA PyTorch weights saved to {torch_path}")
 
-                # Use naming convention diffusers expects
-                clean_name = name.split(".")[-1]  # Get last part of module name
-                adapter_name = "default"
-                rank = args.rank
-
-                # Format keys as diffusers expects
-                up_key = f"{adapter_name}.{clean_name}.{layer_type}.lora_up.weight"
-                down_key = f"{adapter_name}.{clean_name}.{layer_type}.lora_down.weight"
-                alpha_key = f"{adapter_name}.{clean_name}.{layer_type}.alpha"
-
-                # Store the weights
-                lora_state_dict[up_key] = up_weight
-                lora_state_dict[down_key] = down_weight
-                # Store alpha as a tensor
-                lora_state_dict[alpha_key] = torch.tensor(float(rank))
-
-        from safetensors.torch import save_file
-        import json
-
-        # Create metadata as string that safetensors can handle
-        metadata = {
-            "format": "pt",
-            "alpha": str(args.rank),
-            "rank": str(args.rank),
+        # Also save an adapter_config.json file to help with loading
+        adapter_config = {
+            "base_model_name_or_path": args.pretrained_model_name_or_path,
+            "lora_scale": 1.0,
+            "lora_rank": args.rank,
+            "target_modules": ["to_q", "to_k", "to_v", "to_out.0"],
         }
 
-        # Create README with usage instructions
-        readme_content = """# LoRA weights for Stable Diffusion
+        import json
 
-These weights were trained on HAM10000 dermatology dataset.
+        config_path = os.path.join(args.output_dir, "adapter_config.json")
+        with open(config_path, "w") as f:
+            json.dump(adapter_config, f, indent=2)
+        logger.info(f"Adapter config saved to {config_path}")
 
-## Usage
-```python
-from diffusers import StableDiffusionPipeline
-import torch
+        # Also save a README with instructions
+        readme_content = """# LoRA weights for Stable Diffusion HAM10000 Dataset
 
-pipe = StableDiffusionPipeline.from_pretrained(
-    "runwayml/stable-diffusion-v1-5", 
-    torch_dtype=torch.float16
-).to("cuda")
+## Usage Instructions
 
-# For newer diffusers versions
-pipe.load_lora_weights("./", weight_name="pytorch_lora_weights.safetensors")
+These weights need to be loaded using the companion script. Due to LoRA format compatibility 
+issues, we've saved the weights in a directly loadable PyTorch format.
 
-# Or load directly
-pipe.unet.load_attn_procs("./pytorch_lora_weights.safetensors")
+Run the generate_synthetic_images.py script with:
+
+```bash
+python src/generate_synthetic_images.py \\
+  --pretrained_model="runwayml/stable-diffusion-v1-5" \\
+  --lora_weights="models/stable_diffusion_lora/pytorch_lora_weights.bin" \\
+  --lesion_code="df" \\
+  --num_images=20 \\
+  --guidance_scale=7.5 \\
+  --num_inference_steps=50 \\
+  --seed=42 \\
+  --output_dir="data/synthetic/images_dermatofibroma"
 ```
 """
         with open(os.path.join(args.output_dir, "README.md"), "w") as f:
             f.write(readme_content)
 
-        # Save the weights with metadata
-        out_path = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")
-        save_file(lora_state_dict, out_path, metadata=metadata)
-        logger.info(f"LoRA training complete! Weights saved to {out_path}")
+        logger.info(f"LoRA training complete! Results saved to {args.output_dir}")
 
     accelerator.end_training()
 
