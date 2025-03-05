@@ -6,8 +6,8 @@ train_lora.py
 
 Trains LoRA on a Stable Diffusion model for the entire HAM10000 dataset.
 Each image (from a single folder) is paired with a prompt derived from its lesion label
-in HAM10000_metadata.csv. Only the LoRA parameters inserted into the UNet cross-attention
-layers are updated while the base model weights remain frozen.
+in HAM10000_metadata.csv. Only the LoRA parameters injected into the UNet’s cross-attention
+layers are updated while the rest of the model remains frozen.
 
 Example usage:
 ---------------
@@ -38,6 +38,7 @@ from tqdm.auto import tqdm
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.models.lora import LoRALinearLayer
@@ -71,22 +72,25 @@ def parse_args():
         "--metadata_file",
         type=str,
         required=True,
-        help="Path to HAM10000_metadata.csv with columns [image_id, dx, ...].",
+        help="Path to HAM10000_metadata.csv (with columns [image_id, dx, ...]).",
     )
     parser.add_argument(
         "--train_data_dir",
         type=str,
         required=True,
-        help="Directory of processed SD images (512x512), each named <image_id>.jpg.",
+        help="Directory containing processed SD images (512x512), named <image_id>.jpg.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         default="lora-output",
-        help="Directory where LoRA weights are saved (pytorch_lora_weights.safetensors).",
+        help="Directory where LoRA weights will be saved (pytorch_lora_weights.safetensors).",
     )
     parser.add_argument(
-        "--resolution", type=int, default=512, help="Training resolution, e.g., 512."
+        "--resolution",
+        type=int,
+        default=512,
+        help="Training image resolution, e.g. 512.",
     )
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -97,7 +101,7 @@ def parse_args():
         "--rank",
         type=int,
         default=4,
-        help="LoRA rank dimension for each cross-attn projection.",
+        help="LoRA rank dimension for each cross-attention projection.",
     )
     return parser.parse_args()
 
@@ -105,8 +109,9 @@ def parse_args():
 class HAMDataset(Dataset):
     """
     Loads images from train_data_dir using metadata from HAM10000_metadata.csv.
-    Each image is paired with a prompt constructed from its dx code.
-    E.g., if dx == "df", then prompt is "A photo of a Dermatofibroma lesion".
+    For each image, constructs a prompt based on the dx code.
+    For example, if dx == "df" then the prompt is:
+       "A photo of a Dermatofibroma lesion"
     """
 
     def __init__(self, metadata_file, data_root, resolution=512):
@@ -147,6 +152,27 @@ class HAMDataset(Dataset):
         return {"pixel_values": tensor, "prompt": prompt}
 
 
+def inject_lora(linear_layer, rank):
+    """
+    Injects a LoRA module into a given linear layer by:
+      1. Attaching a new LoRALinearLayer as an attribute.
+      2. Overriding the forward method so that it returns:
+             original_forward(x) + lora_layer(x)
+    """
+    if not hasattr(linear_layer, "lora_layer"):
+        linear_layer.lora_layer = LoRALinearLayer(
+            linear_layer.in_features, linear_layer.out_features, rank=rank
+        )
+    # Save original forward if not already done.
+    if not hasattr(linear_layer, "orig_forward"):
+        linear_layer.orig_forward = linear_layer.forward
+
+        def new_forward(x):
+            return linear_layer.orig_forward(x) + linear_layer.lora_layer(x)
+
+        linear_layer.forward = new_forward
+
+
 def main():
     args = parse_args()
     logging.basicConfig(
@@ -155,13 +181,12 @@ def main():
         level=logging.INFO,
     )
     logger.info(args)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps
     )
     set_seed(args.seed)
 
-    # 1) Load base components.
+    # 1) Load base Stable Diffusion components.
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
@@ -196,31 +221,22 @@ def main():
         dataset, batch_size=args.train_batch_size, shuffle=True, drop_last=True
     )
 
-    # 4) Insert LoRA modules into UNet cross-attention layers.
-    for _, module in unet.named_modules():
+    # 4) Inject LoRA into UNet cross-attention linear layers.
+    for name, module in unet.named_modules():
+        # Look for modules that have attributes "to_q", "to_k", and "to_v".
         if (
             hasattr(module, "to_q")
             and hasattr(module, "to_k")
             and hasattr(module, "to_v")
         ):
-            module.to_q.lora_layer = LoRALinearLayer(
-                module.to_q.in_features, module.to_q.out_features, rank=args.rank
-            )
-            module.to_k.lora_layer = LoRALinearLayer(
-                module.to_k.in_features, module.to_k.out_features, rank=args.rank
-            )
-            module.to_v.lora_layer = LoRALinearLayer(
-                module.to_v.in_features, module.to_v.out_features, rank=args.rank
-            )
+            inject_lora(module.to_q, args.rank)
+            inject_lora(module.to_k, args.rank)
+            inject_lora(module.to_v, args.rank)
             if hasattr(module, "to_out") and isinstance(
                 module.to_out, torch.nn.ModuleList
             ):
                 if len(module.to_out) > 0 and hasattr(module.to_out[0], "in_features"):
-                    module.to_out[0].lora_layer = LoRALinearLayer(
-                        module.to_out[0].in_features,
-                        module.to_out[0].out_features,
-                        rank=args.rank,
-                    )
+                    inject_lora(module.to_out[0], args.rank)
 
     # 5) Gather LoRA parameters.
     lora_params = []
@@ -233,7 +249,7 @@ def main():
     # 6) Create optimizer for LoRA parameters.
     optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
 
-    # 7) Create a constant LR scheduler.
+    # 7) Create a constant learning rate scheduler.
     max_steps = args.max_train_steps
     lr_scheduler = get_scheduler(
         "constant",
@@ -248,11 +264,11 @@ def main():
     )
     unet.train()
 
-    # 9) Move VAE and text encoder to device in fp16.
+    # 9) Move VAE and text_encoder to device in FP16.
     device = accelerator.device
     vae.to(device, dtype=torch.float16)
     text_encoder.to(device, dtype=torch.float16)
-    # Note: unet was prepared and will use mixed precision as set via accelerate.
+    # Note: unet is already handled by accelerator.
 
     global_step = 0
     progress_bar = tqdm(range(max_steps), disable=not accelerator.is_local_main_process)
@@ -268,9 +284,9 @@ def main():
         prompts = batch["prompt"]
 
         with accelerator.accumulate(unet):
-            # i) Convert images to latents.
-            # IMPORTANT: Cast pixel_values to half to match VAE's weights.
+            # i) Convert images to latents using VAE.
             with torch.no_grad():
+                # Cast input to half precision.
                 latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
 
             # ii) Sample noise and timesteps.
@@ -327,6 +343,7 @@ def main():
                 prefix = f"unet.{name}"
                 for p_name, p_val in module.lora_layer.state_dict().items():
                     lora_state[f"{prefix}.{p_name}"] = p_val.cpu()
+
         from safetensors.torch import save_file
 
         out_path = os.path.join(args.output_dir, "pytorch_lora_weights.safetensors")

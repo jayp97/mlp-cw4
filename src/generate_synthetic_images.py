@@ -4,8 +4,8 @@
 """
 generate_synthetic_images.py
 
-Loads a base Stable Diffusion model and applies a LoRA checkpoint (trained on the entire HAM10000 dataset).
-A lesion type is specified via --lesion_code (e.g. "df" for Dermatofibroma) and a corresponding prompt is built.
+Loads a base Stable Diffusion model along with a LoRA checkpoint (trained on the entire HAM10000 dataset).
+A lesion type is specified via --lesion_code (e.g., "df" for Dermatofibroma) and a prompt is constructed accordingly.
 Synthetic images are generated and saved to the specified output directory.
 
 Example usage:
@@ -27,7 +27,7 @@ import torch
 from diffusers import StableDiffusionPipeline
 from PIL import Image
 
-# Mapping lesion codes to textual labels.
+# Mapping lesion codes to full textual labels.
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -45,7 +45,7 @@ def parse_args():
         "--pretrained_model",
         type=str,
         required=True,
-        help="Base Stable Diffusion model (e.g., runwayml/stable-diffusion-v1-5).",
+        help="Base Stable Diffusion model, e.g. 'runwayml/stable-diffusion-v1-5'.",
     )
     parser.add_argument(
         "--lora_weights",
@@ -57,7 +57,7 @@ def parse_args():
         "--lesion_code",
         type=str,
         default="df",
-        help="Lesion code to generate (e.g., 'df' for Dermatofibroma).",
+        help="Lesion code to generate (e.g. 'df' for Dermatofibroma).",
     )
     parser.add_argument(
         "--num_images", type=int, default=10, help="Number of images to generate."
@@ -69,10 +69,7 @@ def parse_args():
         help="Classifier-free guidance scale.",
     )
     parser.add_argument(
-        "--num_inference_steps",
-        type=int,
-        default=50,
-        help="Number of denoising steps during generation.",
+        "--num_inference_steps", type=int, default=50, help="Number of denoising steps."
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility."
@@ -81,7 +78,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default="synthetic_output",
-        help="Directory to save generated images.",
+        help="Directory where generated images are saved.",
     )
     return parser.parse_args()
 
@@ -97,7 +94,7 @@ def main():
     label_text = LABEL_MAP[args.lesion_code]
     prompt = f"A photo of a {label_text} lesion"
 
-    # 1) Load the Stable Diffusion pipeline in FP16 mode.
+    # 1) Load the Stable Diffusion pipeline in FP16.
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model, torch_dtype=torch.float16
     ).to("cuda")
@@ -105,7 +102,7 @@ def main():
     # 2) Load the LoRA weights.
     pipe.load_lora_weights(args.lora_weights)
 
-    # 3) Setup generator for reproducibility.
+    # 3) Setup a random generator for reproducibility.
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
 
     # 4) Generate and save images.
