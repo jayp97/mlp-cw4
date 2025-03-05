@@ -5,15 +5,14 @@ finetune_stable_diffusion.py
 
 LoRA fine-tuning on the entire dataset (all labels), using
 a manual LoRA injection approach for cross-attention sub-layers.
-
 We do NOT rely on AttnProcessor(2_0) having parameters, because in
 modern diffusers versions, the default attention processors (like
 AttnProcessor2_0) are parameter-free. Instead, we manually insert LoRA
 down/up submodules into each cross-attention linear layer (to_q, to_k,
 to_v, to_out).
 
-No manual lesion code or placeholder token is needed. We create prompts
-like "(skin lesion, {full_label})" from the metadata CSV for each image.
+We create prompts like "(skin lesion, {full_label})" from the metadata CSV
+for each image.
 
 ----------------------------------------
 Requirements:
@@ -36,8 +35,8 @@ Example Usage:
     --seed=42 \
     --output_dir="models/stable_diffusion_lora"
 
-After completion, the fine-tuned LoRA adapters are saved into
---output_dir (which will contain the UNet with the LoRA hooks).
+After completion, the LoRA adapters (only) are saved into
+--output_dir/lora_weights.safetensors
 """
 
 import argparse
@@ -57,6 +56,9 @@ from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
+
+# We'll import the LoRA saving helpers:
+from diffusers.loaders import StableDiffusionLoraLoaderMixin
 
 # -------------------------------------------------------------------
 # MAPPING: short lesion codes -> full textual label for prompts
@@ -86,7 +88,6 @@ def lora_forward_pre_hook(module, input):
     out_normal = module.original_forward(x)
 
     # The LoRA forward pass: out_lora = lora_up( lora_down( x ) )
-    # Then scaled by module.lora_alpha, typically 1.0
     out_lora = module.lora_up(module.lora_down(x)) * module.lora_alpha
 
     return (out_normal + out_lora,)
@@ -113,7 +114,6 @@ def add_lora_to_linear(linear_layer, rank=4, alpha=1.0):
     torch.nn.init.zeros_(lora_up.weight)
 
     # 3) Convert them to the same dtype as the parent's weight
-    #    to avoid half-vs-float mismatches
     lora_down = lora_down.to(linear_layer.weight.dtype)
     lora_up = lora_up.to(linear_layer.weight.dtype)
 
@@ -122,8 +122,7 @@ def add_lora_to_linear(linear_layer, rank=4, alpha=1.0):
     linear_layer.lora_up = lora_up
     linear_layer.lora_alpha = alpha
 
-    # 5) Overwrite forward with a forward_pre_hook so we can do:
-    #    y = original_forward(x) + lora_up(lora_down(x)) * alpha
+    # 5) Overwrite forward with a forward_pre_hook
     if not hasattr(linear_layer, "original_forward"):
         linear_layer.original_forward = linear_layer.forward
 
@@ -238,7 +237,6 @@ def main():
     vae.requires_grad_(False)
     unet.requires_grad_(False)
 
-    # move them to half & device
     device = accelerator.device
     vae.to(device, dtype=torch.float16)
     unet.to(device, dtype=torch.float16)
@@ -246,8 +244,6 @@ def main():
 
     # ----------------------------------------------------------------
     # 2) Insert LoRA submodules into cross-attn layers
-    # We'll search through unet.named_modules() to find submodules with to_q, to_k, to_v
-    # Then we add LoRA to each of those linear layers
     # ----------------------------------------------------------------
     for name, submodule in unet.named_modules():
         if (
@@ -268,12 +264,12 @@ def main():
             patch_linear_if_exists(submodule.to_v)
 
             if hasattr(submodule, "to_out"):
-                # to_out can be a (linear, dropout) in a list or a single linear
+                # to_out can be (linear, dropout) in a list or a single linear
                 if (
                     isinstance(submodule.to_out, torch.nn.ModuleList)
                     and len(submodule.to_out) > 0
                 ):
-                    # typically [nn.Linear, nn.Dropout], so we patch submodule.to_out[0]
+                    # typically [nn.Linear, nn.Dropout]
                     if isinstance(submodule.to_out[0], torch.nn.Linear):
                         add_lora_to_linear(
                             submodule.to_out[0], rank=args.lora_rank, alpha=1.0
@@ -306,14 +302,14 @@ def main():
     lora_params = []
     for _, mod in unet.named_modules():
         if hasattr(mod, "lora_down") and hasattr(mod, "lora_up"):
-            # each is a linear
             lora_params.append(mod.lora_down.weight)
             lora_params.append(mod.lora_up.weight)
 
     if len(lora_params) == 0:
         raise ValueError(
-            "No LoRA parameters found. Possibly no cross-attn layers found, or code is incompatible with your diffusers version."
+            "No LoRA parameters found. Possibly code mismatch or no cross-attn layers found."
         )
+
     print(f"Found {len(lora_params)} LoRA param tensors in total.")
 
     # Create optimizer & lr scheduler
@@ -342,11 +338,14 @@ def main():
         range(max_train_steps), disable=not accelerator.is_local_main_process
     )
 
+    data_iter = iter(dataloader)  # We'll re-init every epoch, or just do infinite
     for step in range(max_train_steps):
-        # fetch batch
-        batch = next(
-            iter(dataloader)
-        )  # simpler than for loop with StopIteration handling
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
+
         with accelerator.accumulate(unet):
             pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
             input_ids = batch["input_ids"].to(device)
@@ -392,12 +391,30 @@ def main():
             break
 
     # ----------------------------------------------------------------
-    # 6) Save final LoRA fine-tuned model
+    # 6) Save only the LoRA weights
+    #    This produces a separate .safetensors file containing just
+    #    the LoRA submodules. We'll call it 'lora_weights.safetensors'.
     # ----------------------------------------------------------------
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        unet.save_pretrained(args.output_dir)
-        print(f"LoRA fine-tuning complete. Model saved to {args.output_dir}")
+
+        # 1) Extract the LoRA weights from unet
+        unet_lora_dict = StableDiffusionLoraLoaderMixin.unet_attn_processors_state_dict(
+            unet
+        )
+
+        # 2) Save them
+        StableDiffusionLoraLoaderMixin.save_lora_weights(
+            save_directory=args.output_dir,
+            unet_lora_layers=unet_lora_dict,
+            is_main_process=True,
+            safe_serialization=True,
+            weight_name="lora_weights.safetensors",
+        )
+
+        print(
+            f"LoRA fine-tuning complete!\nLoRA-only weights saved to: {args.output_dir}/lora_weights.safetensors"
+        )
 
 
 if __name__ == "__main__":

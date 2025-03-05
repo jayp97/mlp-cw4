@@ -3,15 +3,18 @@
 """
 generate_synthetic_images.py
 
-Generates synthetic skin lesion images for a given target label using a fine-tuned
-Stable Diffusion model (with LoRA) and the learned/fine-tuned model.
+Generates synthetic skin lesion images for a given target label using:
+  1) The base Stable Diffusion model (e.g. "runwayml/stable-diffusion-v1-5"), plus
+  2) The LoRA checkpoint we fine-tuned ("lora_weights.safetensors").
+
 At generation time you specify either:
   --target_label="Dermatofibroma"
 or
   --lesion_code="df"   (which maps to "Dermatofibroma" via LABEL_MAP)
 
-The script filters the metadata CSV to find all images matching that label, then uses
-each image as an init_image in an img2img pipeline, producing synthetic output images.
+This script filters the metadata CSV to find all images matching that label,
+then uses each image as an init_image in an img2img pipeline, producing
+synthetic output images.
 
 Arguments:
   --pretrained_model_name_or_path : Base Stable Diffusion model (e.g. "runwayml/stable-diffusion-v1-5").
@@ -20,7 +23,7 @@ Arguments:
   --lesion_code                   : Alternatively, a short code (e.g., "df"); if target_label is not given, we map the code to a full label.
   --train_data_dir                : Folder containing all processed images (512x512; no subfolders).
   --output_dir                    : Folder where the generated synthetic images will be saved.
-  --lora_weights                  : (Optional) Path to the LoRA weights file (e.g., "adapter_model.safetensors").
+  --lora_weights                  : Path to the LoRA-only file (e.g., "lora_weights.safetensors").
   --guidance_scale                : Guidance scale for generation (default=7.5).
   --num_inference_steps           : Number of denoising steps (default=50).
   --strength                      : Strength for the img2img transformation (default=0.8).
@@ -34,7 +37,7 @@ python generate_synthetic_images.py \
   --lesion_code="df" \
   --train_data_dir="data/processed_sd/images" \
   --output_dir="data/synthetic/images_dermatofibroma" \
-  --lora_weights="models/stable_diffusion_lora/adapter_model.safetensors" \
+  --lora_weights="models/stable_diffusion_lora/lora_weights.safetensors" \
   --guidance_scale=7.5 \
   --num_inference_steps=50 \
   --strength=0.8 \
@@ -47,11 +50,12 @@ import os
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
-from diffusers import StableDiffusionImg2ImgPipeline
-from diffusers.loaders import LoraLoaderMixin
 import pandas as pd
 
-# Mapping from short lesion codes to full labels.
+# We'll use the recommended API for loading LoRA into a pipeline
+from diffusers.loaders import StableDiffusionLoraLoaderMixin
+from diffusers import StableDiffusionImg2ImgPipeline
+
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -92,7 +96,7 @@ def parse_args():
         "--lora_weights",
         type=str,
         default=None,
-        help="Path to the LoRA weights file (e.g., adapter_model.safetensors)",
+        help="Path to the LoRA-only .safetensors file (e.g., lora_weights.safetensors)",
     )
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -121,45 +125,43 @@ def main():
     )
     filtered = metadata[metadata["full_label"].str.lower() == args.target_label.lower()]
     image_ids = filtered["image_id"].tolist()
-    image_files = [
-        os.path.join(args.train_data_dir, f"{img_id}.jpg")
-        for img_id in image_ids
-        if os.path.exists(os.path.join(args.train_data_dir, f"{img_id}.jpg"))
-    ]
+    image_files = []
+    for img_id in image_ids:
+        path_jpg = os.path.join(args.train_data_dir, f"{img_id}.jpg")
+        if os.path.exists(path_jpg):
+            image_files.append(path_jpg)
+
     if not image_files:
         print(f"No images found for target label '{args.target_label}'. Exiting.")
         return
 
-    # 1) Load the Stable Diffusion img2img pipeline.
+    # 1) Load the base Stable Diffusion img2img pipeline
+    #    We'll add LoRA on top in a moment.
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch.float16,
-        safety_checker=None,  # Safety checker disabled per user request.
+        safety_checker=None,  # user request
     ).to(args.device)
 
-    # 2) Load fine-tuned LoRA weights if provided.
+    # 2) If LoRA is provided, load it
     if args.lora_weights and os.path.exists(args.lora_weights):
         try:
-            # Retrieve the state_dict and alphas
-            state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(
-                args.lora_weights
-            )
-            # Load them into the unet
-            LoraLoaderMixin.load_lora_into_unet(
-                state_dict=state_dict, network_alphas=network_alphas, unet=pipe.unet
-            )
-            print(f"Loaded LoRA weights from {args.lora_weights}")
+            # Simple approach: ask the pipeline to load the LoRA
+            pipe.load_lora_weights(args.lora_weights)
+            print(f"Loaded LoRA weights from: {args.lora_weights}")
         except Exception as e:
             print(f"Error loading LoRA weights: {e}")
     else:
         print(
-            "Warning: --lora_weights not provided or file does not exist; using base UNet."
+            "Warning: --lora_weights not provided or file does not exist; using base UNet only."
         )
 
     pipe.unet.to(args.device, dtype=torch.float16)
 
-    # 3) Generate synthetic images using img2img.
+    # 3) Generate synthetic images
     prompt = f"(skin lesion, {args.target_label})"
+    print(f"Generating images with prompt: {prompt}")
+
     for img_path in tqdm(image_files, desc="Generating synthetic images"):
         try:
             init_img = (
