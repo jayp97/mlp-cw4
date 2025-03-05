@@ -5,12 +5,12 @@
 generate_synthetic_images.py
 
 Loads a base Stable Diffusion model along with a LoRA checkpoint (trained on the entire HAM10000 dataset).
-You can specify which lesion type to generate by passing --lesion_code (e.g. "df" for Dermatofibroma).
-The script constructs a prompt like "A photo of a Dermatofibroma lesion" and generates synthetic images.
+You specify which lesion type to generate by passing --lesion_code (e.g. "df" for Dermatofibroma).
+The script constructs a prompt such as "A photo of a Dermatofibroma lesion" and generates synthetic images.
 
 Example usage:
 ---------------
-python generate_synthetic_images.py \
+python src/generate_synthetic_images.py \
   --pretrained_model "runwayml/stable-diffusion-v1-5" \
   --lora_weights "models/stable_diffusion_lora/pytorch_lora_weights.safetensors" \
   --lesion_code "df" \
@@ -27,7 +27,7 @@ import torch
 from diffusers import StableDiffusionPipeline
 from PIL import Image
 
-# Dictionary mapping lesion codes to full labels (same as in train_lora.py)
+# Mapping lesion codes to textual labels (same as in train_lora.py)
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -96,7 +96,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Convert lesion code to its full textual label
+    # Convert lesion code to full textual label
     if args.lesion_code not in LABEL_MAP:
         raise ValueError(
             f"Unknown lesion code '{args.lesion_code}'. Valid codes: {list(LABEL_MAP.keys())}"
@@ -104,15 +104,15 @@ def main():
     label_text = LABEL_MAP[args.lesion_code]
     prompt = f"A photo of a {label_text} lesion"
 
-    # Load the Stable Diffusion pipeline in FP16
+    # Load the Stable Diffusion pipeline in FP16 mode
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model, torch_dtype=torch.float16
     ).to("cuda")
 
-    # Load LoRA weights into the pipeline (this method loads them into both UNet and text encoder)
+    # Load LoRA weights into the pipeline (loads into both UNet and text encoder)
     pipe.load_lora_weights(args.lora_weights)
 
-    # Set a generator for reproducibility
+    # Set up a generator for reproducibility
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
 
     # Generate and save images

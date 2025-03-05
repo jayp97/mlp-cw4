@@ -5,9 +5,9 @@
 train_lora.py
 
 Trains LoRA on top of a Stable Diffusion model for the entire HAM10000 dataset at once.
-No subfolders are required. Instead, each image is paired with a textual prompt generated 
-from its lesion label in HAM10000_metadata.csv. This script fine-tunes only the LoRA parameters
-(inserted into the UNet's cross-attention layers) while keeping the original weights frozen.
+No subfolders are required – each image is paired with a textual prompt generated from its
+lesion label in HAM10000_metadata.csv. Only the LoRA parameters (inserted into the UNet's 
+cross-attention layers) are updated during training while the base weights remain frozen.
 
 Example usage:
 ---------------
@@ -28,7 +28,6 @@ After training, the LoRA checkpoint is saved as "pytorch_lora_weights.safetensor
 
 import argparse
 import os
-import math
 import logging
 import random
 import itertools
@@ -52,7 +51,7 @@ from transformers import CLIPTokenizer, CLIPTextModel
 logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
-# Mapping from lesion codes (HAM10000) to full textual labels
+# Mapping from lesion codes (HAM10000) to full textual labels.
 # -------------------------------------------------------------------
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
@@ -79,13 +78,13 @@ def parse_args():
         "--metadata_file",
         type=str,
         required=True,
-        help="Path to 'HAM10000_metadata.csv' which has columns [image_id, dx, ...].",
+        help="Path to 'HAM10000_metadata.csv' with columns like [image_id, dx, ...].",
     )
     parser.add_argument(
         "--train_data_dir",
         type=str,
         required=True,
-        help="Directory containing all processed SD images (512x512), each named <image_id>.jpg.",
+        help="Directory containing all processed SD images (e.g. 512x512), named <image_id>.jpg.",
     )
     parser.add_argument(
         "--output_dir",
@@ -112,9 +111,9 @@ def parse_args():
 
 class HAMDataset(Dataset):
     """
-    Loads images from 'train_data_dir' using metadata in 'HAM10000_metadata.csv'.
-    Constructs a text prompt for each image based on its lesion label.
-    For example, if dx = "df" then the prompt becomes:
+    Loads images from the training directory using metadata from HAM10000_metadata.csv.
+    Each image is paired with a prompt based on its lesion label.
+    For example, if dx == "df" then the prompt is:
       "A photo of a Dermatofibroma lesion"
     """
 
@@ -150,7 +149,7 @@ class HAMDataset(Dataset):
             image = image.convert("RGB")
         image = image.resize((self.resolution, self.resolution), resample=Image.BICUBIC)
         arr = np.array(image, dtype=np.uint8)
-        # Scale [0,255] to [-1,1]
+        # Scale pixel values from [0, 255] to [-1, 1]
         arr = (arr / 127.5) - 1.0
         arr = arr.astype(np.float32)
         tensor = torch.from_numpy(arr).permute(2, 0, 1)
@@ -172,7 +171,7 @@ def main():
     )
     set_seed(args.seed)
 
-    # 1) Load tokenizer, text encoder, VAE, UNet, and noise scheduler
+    # 1) Load tokenizer, text encoder, VAE, UNet, and noise scheduler from the base SD model.
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
@@ -204,7 +203,7 @@ def main():
         dataset, batch_size=args.train_batch_size, shuffle=True, drop_last=True
     )
 
-    # 3) Insert LoRA modules into UNet cross-attention layers
+    # 3) Insert LoRA modules into UNet cross-attention layers.
     for name, module in unet.named_modules():
         if (
             hasattr(module, "to_q")
@@ -230,16 +229,20 @@ def main():
                         rank=args.rank,
                     )
 
-    # 4) Gather all LoRA parameters from UNet
+    # 4) Gather all LoRA parameters from UNet.
     lora_params = []
     for _, submodule in unet.named_modules():
         if hasattr(submodule, "lora_layer"):
             lora_params.extend(submodule.lora_layer.parameters())
 
-    # 5) Create optimizer for LoRA params
+    # **Make sure these parameters require gradients.**
+    for p in lora_params:
+        p.requires_grad = True
+
+    # 5) Create optimizer for LoRA parameters.
     optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
 
-    # 6) Create a constant learning rate scheduler
+    # 6) Create a constant learning rate scheduler.
     max_steps = args.max_train_steps
     lr_scheduler = get_scheduler(
         "constant",
@@ -248,17 +251,17 @@ def main():
         num_training_steps=max_steps,
     )
 
-    # 7) Prepare models, optimizer, and dataloader with accelerator
+    # 7) Prepare models, optimizer, and dataloader with accelerator.
     unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, dataloader, lr_scheduler
     )
     unet.train()
 
-    # 8) Send VAE and text_encoder to device in FP16 and also convert UNet to FP16
+    # 8) Send VAE and text_encoder to device in FP16; also convert UNet to FP16.
     device = accelerator.device
     vae.to(device, dtype=torch.float16)
     text_encoder.to(device, dtype=torch.float16)
-    unet.to(device, dtype=torch.float16)  # Ensure UNet parameters are in half precision
+    unet.to(device, dtype=torch.float16)
 
     global_step = 0
     progress_bar = tqdm(range(max_steps), disable=not accelerator.is_local_main_process)
@@ -271,12 +274,12 @@ def main():
             batch = next(dataloader_iter)
 
         with accelerator.accumulate(unet):
-            # 9) Convert images to latents using VAE
+            # 9) Convert images to latents using the VAE.
             pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
             with torch.no_grad():
                 latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
 
-            # 10) Sample noise and timesteps
+            # 10) Sample noise and timesteps.
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
             timesteps = torch.randint(
@@ -288,7 +291,7 @@ def main():
             )
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # 11) Tokenize the prompt and compute text embeddings
+            # 11) Tokenize the prompt and compute text embeddings.
             prompts = batch["prompt"]
             tokenized = tokenizer(
                 list(prompts),
@@ -301,7 +304,7 @@ def main():
                 text_out = text_encoder(**tokenized)
                 encoder_hidden_states = text_out[0].half()
 
-            # 12) Forward pass through UNet and compute loss
+            # 12) Forward pass through UNet and compute the MSE loss.
             noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             accelerator.backward(loss)
@@ -319,7 +322,7 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        # 13) Extract and save LoRA weights from UNet
+        # 13) Extract and save LoRA weights from UNet.
         unet_lora_state_dict = {}
         for name, module in accelerator.unwrap_model(unet).named_modules():
             if hasattr(module, "lora_layer"):
