@@ -3,26 +3,52 @@
 """
 finetune_stable_diffusion.py
 
-LoRA fine-tuning on the entire dataset (all labels). We do not rely on AttnProcessor
-having parameters. Instead, we manually insert LoRA into the UNet cross-attn sub-layers
-(e.g. to_q, to_k, to_v, to_out).
+LoRA fine-tuning on the entire dataset (all labels), using
+a manual LoRA injection approach for cross-attention sub-layers.
 
-No manual lesion code or placeholder token is needed. The dataset uses the metadata CSV
-to build prompts: (skin lesion, {full_label}).
+We do NOT rely on AttnProcessor(2_0) having parameters, because in
+modern diffusers versions, the default attention processors (like
+AttnProcessor2_0) are parameter-free. Instead, we manually insert LoRA
+down/up submodules into each cross-attention linear layer (to_q, to_k,
+to_v, to_out).
 
-Requires:
+No manual lesion code or placeholder token is needed. We create prompts
+like "(skin lesion, {full_label})" from the metadata CSV for each image.
+
+----------------------------------------
+Requirements:
   - diffusers >= 0.14
   - accelerate
   - safetensors
+  - torch
+----------------------------------------
+
+Example Usage:
+  python finetune_stable_diffusion.py \
+    --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+    --metadata_file="data/raw/HAM10000_metadata.csv" \
+    --train_data_dir="data/processed_sd/images" \
+    --resolution=512 \
+    --learning_rate=5e-5 \
+    --max_train_steps=1000 \
+    --batch_size=1 \
+    --lora_rank=4 \
+    --seed=42 \
+    --output_dir="models/stable_diffusion_lora"
+
+After completion, the fine-tuned LoRA adapters are saved into
+--output_dir (which will contain the UNet with the LoRA hooks).
 """
 
 import argparse
 import os
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from PIL import Image
+
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from accelerate import Accelerator
@@ -32,62 +58,9 @@ from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 
-
-# ---------- LO RA Implementation -----------
-# We define a simple LoRA injection approach for cross-attention sub-layers.
-def lora_layer_hook(module, input, output):
-    # If we inserted a lora_down and lora_up in module, we add them here.
-    if hasattr(module, "lora_down") and hasattr(module, "lora_up"):
-        # lora_scale can be an attribute if we want to scale the LoRA output
-        lora_scale = getattr(module, "lora_scale", 1.0)
-        # The output is basically: output + (lora_up(lora_down(input)) * alpha)
-        return output + (module.lora_up(module.lora_down(input[0]))) * lora_scale
-    return output
-
-
-def create_lora_weights_for_attn_module(module, lora_rank=4, lora_alpha=1.0):
-    """
-    Insert LoRA down/up submodules into the linear layers of a cross-attn block:
-      to_q, to_k, to_v, to_out[0], etc.
-    This is a simplified approach.
-    """
-
-    # We'll define a small helper:
-    def add_lora_to_linear(linear_layer):
-        # Create lora_down and lora_up
-        in_features = linear_layer.in_features
-        out_features = linear_layer.out_features
-        # lora_down: rank x in_features
-        lora_down = torch.nn.Linear(in_features, lora_rank, bias=False)
-        # lora_up: out_features x rank
-        lora_up = torch.nn.Linear(lora_rank, out_features, bias=False)
-        # Initialize
-        torch.nn.init.zeros_(lora_down.weight)
-        torch.nn.init.zeros_(lora_up.weight)
-
-        # Set them as attributes
-        linear_layer.lora_down = lora_down
-        linear_layer.lora_up = lora_up
-        linear_layer.lora_scale = lora_alpha
-        # Overwrite forward hook
-        # Instead of rewriting forward, we can do a forward_pre_hook or forward_hook
-        # We'll do a forward_pre_hook so we can see input
-        if not hasattr(linear_layer, "_lora_hooked"):
-            linear_layer.register_forward_hook(lora_layer_hook)
-            linear_layer._lora_hooked = True
-
-    # Now let's see if the module is an attention sub-layer with to_q, to_k, to_v, etc.
-    if hasattr(module, "to_q") and isinstance(module.to_q, torch.nn.Linear):
-        add_lora_to_linear(module.to_q)
-    if hasattr(module, "to_k") and isinstance(module.to_k, torch.nn.Linear):
-        add_lora_to_linear(module.to_k)
-    if hasattr(module, "to_v") and isinstance(module.to_v, torch.nn.Linear):
-        add_lora_to_linear(module.to_v)
-    if hasattr(module, "to_out") and isinstance(module.to_out[0], torch.nn.Linear):
-        add_lora_to_linear(module.to_out[0])
-
-
-# Mapping from short lesion codes to full names
+# -------------------------------------------------------------------
+# MAPPING: short lesion codes -> full textual label for prompts
+# -------------------------------------------------------------------
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -99,36 +72,81 @@ LABEL_MAP = {
 }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
-    parser.add_argument(
-        "--metadata_file",
-        type=str,
-        required=True,
-        help="CSV file containing metadata (e.g. HAM10000_metadata.csv).",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        required=True,
-        help="Folder with 512×512 images (all labels).",
-    )
-    parser.add_argument("--resolution", type=int, default=512)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
-    parser.add_argument("--max_train_steps", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--lora_rank", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--output_dir", type=str, default="./output/stable_diffusion_lora"
-    )
-    return parser.parse_args()
+# -------------------------------------------------------------------
+# LoRA Hook: We'll define a forward_pre_hook to add LoRA's contribution
+# -------------------------------------------------------------------
+def lora_forward_pre_hook(module, input):
+    """
+    We intercept the forward pass of the original linear layer.
+    'module' has lora_down and lora_up, each a small linear layer.
+    input is a tuple of (x, ) i.e. the input tensor(s).
+    """
+    x = input[0]  # The original input to the linear layer
+    # The standard (original) forward output:
+    out_normal = module.original_forward(x)
+
+    # The LoRA forward pass: out_lora = lora_up( lora_down( x ) )
+    # Then scaled by module.lora_alpha, typically 1.0
+    out_lora = module.lora_up(module.lora_down(x)) * module.lora_alpha
+
+    return (out_normal + out_lora,)
 
 
+def add_lora_to_linear(linear_layer, rank=4, alpha=1.0):
+    """
+    Insert LoRA submodules (lora_down, lora_up) into the given linear_layer.
+    We'll attach a forward_pre_hook so that:
+      out = original_forward(x) + alpha * lora_up(lora_down(x))
+    """
+    if not isinstance(linear_layer, torch.nn.Linear):
+        return
+
+    # 1) Create LoRA down & up
+    in_features = linear_layer.in_features
+    out_features = linear_layer.out_features
+
+    lora_down = torch.nn.Linear(in_features, rank, bias=False)
+    lora_up = torch.nn.Linear(rank, out_features, bias=False)
+
+    # 2) Zero init so that they start as no-op
+    torch.nn.init.zeros_(lora_down.weight)
+    torch.nn.init.zeros_(lora_up.weight)
+
+    # 3) Convert them to the same dtype as the parent's weight
+    #    to avoid half-vs-float mismatches
+    lora_down = lora_down.to(linear_layer.weight.dtype)
+    lora_up = lora_up.to(linear_layer.weight.dtype)
+
+    # 4) Attach them
+    linear_layer.lora_down = lora_down
+    linear_layer.lora_up = lora_up
+    linear_layer.lora_alpha = alpha
+
+    # 5) Overwrite forward with a forward_pre_hook so we can do:
+    #    y = original_forward(x) + lora_up(lora_down(x)) * alpha
+    if not hasattr(linear_layer, "original_forward"):
+        linear_layer.original_forward = linear_layer.forward
+
+        def dummy_forward(x):
+            # The real logic is in the forward_pre_hook
+            return x
+
+        linear_layer.forward = dummy_forward
+
+    # 6) Register the hook once
+    if not getattr(linear_layer, "_lora_hook_registered", False):
+        linear_layer.register_forward_pre_hook(lora_forward_pre_hook)
+        linear_layer._lora_hook_registered = True
+
+
+# -------------------------------------------------------------------
+# Our dataset class (full dataset, all labels)
+# -------------------------------------------------------------------
 class AllLesionDataset(Dataset):
     """
-    For each row in the metadata, we load image and build prompt: (skin lesion, {full_label})
+    For each row in the metadata, we load the image and build a prompt:
+       (skin lesion, {full_label})
+    Where full_label is the full text from LABEL_MAP or the dx if missing.
     """
 
     def __init__(self, data_root, metadata_file, resolution, tokenizer):
@@ -144,11 +162,11 @@ class AllLesionDataset(Dataset):
     def __getitem__(self, idx):
         row = self.metadata.iloc[idx]
         image_id = row["image_id"]
-        dx = row["dx"].lower()
-        full_label = LABEL_MAP.get(dx, dx)  # default to dx if not in map
+        dx_code = str(row["dx"]).lower().strip()
+        full_label = LABEL_MAP.get(dx_code, dx_code)
         prompt = f"(skin lesion, {full_label})"
 
-        # Tokenize
+        # Tokenize prompt for conditioning
         tokenized_text = self.tokenizer(
             prompt,
             padding="max_length",
@@ -158,121 +176,115 @@ class AllLesionDataset(Dataset):
         ).input_ids[0]
 
         # Load image
-        image_path = os.path.join(self.data_root, f"{image_id}.jpg")
-        image = Image.open(image_path).convert("RGB")
+        img_path = os.path.join(self.data_root, f"{image_id}.jpg")
+        image = Image.open(img_path).convert("RGB")
         image = image.resize((self.resolution, self.resolution), Image.BICUBIC)
-        image_np = np.array(image).astype(np.uint8)
-        image_np = (image_np / 127.5 - 1.0).astype(np.float32)
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1)
+        arr = np.array(image).astype(np.uint8)
+        arr = (arr / 127.5 - 1.0).astype(np.float32)
+        tensor = torch.from_numpy(arr).permute(2, 0, 1)
 
-        return {"pixel_values": image_tensor, "input_ids": tokenized_text}
+        return {"pixel_values": tensor, "input_ids": tokenized_text}
 
 
 def main():
-    args = parse_args()
+    # ----------------------------------------------------------------
+    # Parse args, set up Accelerator, fix random seeds
+    # ----------------------------------------------------------------
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    parser.add_argument(
+        "--metadata_file",
+        type=str,
+        required=True,
+        help="Metadata CSV (e.g. HAM10000_metadata.csv).",
+    )
+    parser.add_argument(
+        "--train_data_dir", type=str, required=True, help="Folder with 512x512 images."
+    )
+    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--max_train_steps", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--lora_rank", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--output_dir", type=str, default="./output/stable_diffusion_lora"
+    )
+
+    args = parser.parse_args()
     accelerator = Accelerator()
     set_seed(args.seed)
 
-    # 1) Load CLIP tokenizer & text encoder
+    # ----------------------------------------------------------------
+    # 1) Load the base SD components (tokenizer, text encoder, VAE, UNet)
+    # ----------------------------------------------------------------
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer"
     )
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder"
     )
-    # Freeze text encoder
+    # Freeze text encoder (not training it)
     for param in text_encoder.parameters():
         param.requires_grad = False
 
-    # 2) Load VAE & UNet
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae"
     )
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet"
     )
+    # freeze original
     vae.requires_grad_(False)
     unet.requires_grad_(False)
 
-    vae.to(accelerator.device, dtype=torch.float16)
-    unet.to(accelerator.device, dtype=torch.float16)
-    text_encoder.to(accelerator.device, dtype=torch.float16)
+    # move them to half & device
+    device = accelerator.device
+    vae.to(device, dtype=torch.float16)
+    unet.to(device, dtype=torch.float16)
+    text_encoder.to(device, dtype=torch.float16)
 
-    # 3) Insert LoRA submodules into cross-attention layers
-    # We'll iterate over all UNet submodules, find cross-attn blocks, and insert LoRA
+    # ----------------------------------------------------------------
+    # 2) Insert LoRA submodules into cross-attn layers
+    # We'll search through unet.named_modules() to find submodules with to_q, to_k, to_v
+    # Then we add LoRA to each of those linear layers
+    # ----------------------------------------------------------------
     for name, submodule in unet.named_modules():
-        # The cross-attn blocks typically have "Transformer2DModel" in their path or "Attention".
-        # But the best approach is to detect that submodule has to_q, to_k, to_v attributes:
         if (
             hasattr(submodule, "to_q")
+            and isinstance(submodule.to_q, torch.nn.Linear)
             and hasattr(submodule, "to_k")
+            and isinstance(submodule.to_k, torch.nn.Linear)
             and hasattr(submodule, "to_v")
+            and isinstance(submodule.to_v, torch.nn.Linear)
         ):
-            # We'll add LoRA to each of these linear layers
-            # Example function create_lora_weights_for_attn_module could be used
-            # But let's inline it for clarity:
-            def add_lora_to_linear(linear_layer, rank=4, alpha=1.0):
-                # Create two linear layers of rank
-                in_features = linear_layer.in_features
-                out_features = linear_layer.out_features
-                # lora_down
-                lora_down = torch.nn.Linear(in_features, rank, bias=False)
-                torch.nn.init.zeros_(lora_down.weight)
-                # lora_up
-                lora_up = torch.nn.Linear(rank, out_features, bias=False)
-                torch.nn.init.zeros_(lora_up.weight)
+            # Add LoRA to submodule.to_q, submodule.to_k, submodule.to_v, and submodule.to_out
+            def patch_linear_if_exists(layer):
+                if isinstance(layer, torch.nn.Linear):
+                    add_lora_to_linear(layer, rank=args.lora_rank, alpha=1.0)
 
-                linear_layer.lora_down = lora_down
-                linear_layer.lora_up = lora_up
-                linear_layer.lora_alpha = alpha
+            patch_linear_if_exists(submodule.to_q)
+            patch_linear_if_exists(submodule.to_k)
+            patch_linear_if_exists(submodule.to_v)
 
-                # We'll attach a forward_pre_hook
-                def lora_forward_pre_hook(module, input):
-                    # input is a tuple of (x,)
-                    x = input[0]
-                    # normal forward
-                    out = module.original_forward(x)
-                    # lora forward
-                    out_lora = module.lora_up(module.lora_down(x)) * module.lora_alpha
-                    return (out + out_lora,)
-
-                if not hasattr(linear_layer, "original_forward"):
-                    linear_layer.original_forward = linear_layer.forward
-
-                    def new_forward(x):
-                        # We'll rely on the forward_pre_hook above
-                        return x
-
-                    linear_layer.forward = new_forward
-
-                # Insert the forward_pre_hook if not inserted
-                found_hook = getattr(linear_layer, "_lora_hook_registered", False)
-                if not found_hook:
-                    linear_layer.register_forward_pre_hook(lora_forward_pre_hook)
-                    linear_layer._lora_hook_registered = True
-
-            # Now actually patch submodule's layers
-            # submodule.to_q etc. are typically nn.Linear
-            add_lora_to_linear(submodule.to_q, rank=args.lora_rank, alpha=1.0)
-            add_lora_to_linear(submodule.to_k, rank=args.lora_rank, alpha=1.0)
-            add_lora_to_linear(submodule.to_v, rank=args.lora_rank, alpha=1.0)
-            if hasattr(submodule, "to_out") and isinstance(
-                submodule.to_out, torch.nn.ModuleList
-            ):
-                # Typically submodule.to_out is [linear, dropout].
-                # We'll patch submodule.to_out[0] if it is linear.
-                if len(submodule.to_out) > 0 and isinstance(
-                    submodule.to_out[0], torch.nn.Linear
+            if hasattr(submodule, "to_out"):
+                # to_out can be a (linear, dropout) in a list or a single linear
+                if (
+                    isinstance(submodule.to_out, torch.nn.ModuleList)
+                    and len(submodule.to_out) > 0
                 ):
-                    add_lora_to_linear(
-                        submodule.to_out[0], rank=args.lora_rank, alpha=1.0
-                    )
-            elif hasattr(submodule, "to_out") and isinstance(
-                submodule.to_out, torch.nn.Linear
-            ):
-                add_lora_to_linear(submodule.to_out, rank=args.lora_rank, alpha=1.0)
+                    # typically [nn.Linear, nn.Dropout], so we patch submodule.to_out[0]
+                    if isinstance(submodule.to_out[0], torch.nn.Linear):
+                        add_lora_to_linear(
+                            submodule.to_out[0], rank=args.lora_rank, alpha=1.0
+                        )
+                elif isinstance(submodule.to_out, torch.nn.Linear):
+                    # direct linear
+                    add_lora_to_linear(submodule.to_out, rank=args.lora_rank, alpha=1.0)
 
-    # 4) Create dataset
+    # ----------------------------------------------------------------
+    # 3) Create dataset & dataloader
+    # ----------------------------------------------------------------
     dataset = AllLesionDataset(
         data_root=args.train_data_dir,
         metadata_file=args.metadata_file,
@@ -283,24 +295,28 @@ def main():
         dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
     )
 
-    # 5) Create noise scheduler & gather LoRA parameters
+    # ----------------------------------------------------------------
+    # 4) Create noise scheduler & gather LoRA parameters
+    # ----------------------------------------------------------------
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
 
-    # gather LoRA parameters
+    # gather LoRA parameters by scanning for lora_down/lora_up
     lora_params = []
-    for _, subm in unet.named_modules():
-        # if subm has lora_down/lora_up, gather them
-        if hasattr(subm, "lora_down") and hasattr(subm, "lora_up"):
-            lora_params.append(subm.lora_down.weight)
-            lora_params.append(subm.lora_up.weight)
+    for _, mod in unet.named_modules():
+        if hasattr(mod, "lora_down") and hasattr(mod, "lora_up"):
+            # each is a linear
+            lora_params.append(mod.lora_down.weight)
+            lora_params.append(mod.lora_up.weight)
+
     if len(lora_params) == 0:
         raise ValueError(
-            "No LoRA parameters found. Possibly the code didn't find cross-attn layers or your diffusers version is too new/old."
+            "No LoRA parameters found. Possibly no cross-attn layers found, or code is incompatible with your diffusers version."
         )
     print(f"Found {len(lora_params)} LoRA param tensors in total.")
 
+    # Create optimizer & lr scheduler
     optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
     max_train_steps = args.max_train_steps
     lr_scheduler = get_scheduler(
@@ -310,6 +326,7 @@ def main():
         num_training_steps=max_train_steps,
     )
 
+    # Prepare with Accelerator
     unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, dataloader, lr_scheduler
     )
@@ -317,42 +334,52 @@ def main():
     vae.eval()
     text_encoder.eval()
 
+    # ----------------------------------------------------------------
+    # 5) Fine-tuning loop
+    # ----------------------------------------------------------------
     global_step = 0
     progress_bar = tqdm(
         range(max_train_steps), disable=not accelerator.is_local_main_process
     )
 
     for step in range(max_train_steps):
-        batch = next(iter(dataloader))
+        # fetch batch
+        batch = next(
+            iter(dataloader)
+        )  # simpler than for loop with StopIteration handling
         with accelerator.accumulate(unet):
-            pixel_values = batch["pixel_values"].to(
-                accelerator.device, dtype=torch.float32
-            )
-            input_ids = batch["input_ids"].to(accelerator.device)
+            pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
+            input_ids = batch["input_ids"].to(device)
 
-            # Encode images to latents
-            latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
+            # 1) encode images to latents
+            with torch.no_grad():
+                latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
+
+            # 2) sample random noise
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
 
-            # Random timesteps
+            # 3) random timesteps
             timesteps = torch.randint(
                 0,
                 noise_scheduler.config.num_train_timesteps,
                 (bsz,),
-                device=latents.device,
+                device=device,
                 dtype=torch.long,
             )
+            # 4) add noise
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
+            # 5) text encoder forward
             with torch.no_grad():
-                enc_out = text_encoder(input_ids=input_ids)
-                encoder_hidden_states = enc_out[0].half()
+                text_out = text_encoder(input_ids=input_ids)
+                encoder_hidden_states = text_out[0].half()
 
-            # Predict noise
+            # 6) U-Net forward to predict noise
             noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
             loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
+            # 7) Backprop
             accelerator.backward(loss)
             optimizer.step()
             lr_scheduler.step()
@@ -364,11 +391,13 @@ def main():
         if global_step >= max_train_steps:
             break
 
+    # ----------------------------------------------------------------
+    # 6) Save final LoRA fine-tuned model
+    # ----------------------------------------------------------------
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        # We save the entire UNet with patched LoRA sub-layers
         unet.save_pretrained(args.output_dir)
-        print(f"LoRA fine-tuning complete. Saved to {args.output_dir}")
+        print(f"LoRA fine-tuning complete. Model saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
