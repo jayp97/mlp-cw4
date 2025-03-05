@@ -56,6 +56,9 @@ from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from transformers import CLIPTextModel, CLIPTokenizer
 
+# We import StableDiffusionLoraLoaderMixin for consistency.
+from diffusers.loaders import StableDiffusionLoraLoaderMixin
+
 # For saving with safetensors:
 from safetensors.torch import save_file
 
@@ -105,7 +108,11 @@ def add_lora_to_linear(linear_layer, rank=4, alpha=1.0):
 
     if not hasattr(linear_layer, "original_forward"):
         linear_layer.original_forward = linear_layer.forward
-        linear_layer.forward = lambda x: x  # Dummy forward to trigger hook
+
+        def dummy_forward(x):
+            return x
+
+        linear_layer.forward = dummy_forward
 
     if not getattr(linear_layer, "_lora_hook_registered", False):
         linear_layer.register_forward_pre_hook(lora_forward_pre_hook)
@@ -157,12 +164,9 @@ def extract_lora_weights(model):
     state = {}
     for name, module in model.named_modules():
         if hasattr(module, "lora_down") and hasattr(module, "lora_up"):
-            # Prefix keys with 'unet.'
-            state[f"unet.{name}.lora_down.weight"] = (
-                module.lora_down.weight.detach().cpu()
-            )
-            state[f"unet.{name}.lora_up.weight"] = module.lora_up.weight.detach().cpu()
-            state[f"unet.{name}.lora_alpha"] = torch.tensor(
+            state[f"{name}.lora_down.weight"] = module.lora_down.weight.detach().cpu()
+            state[f"{name}.lora_up.weight"] = module.lora_up.weight.detach().cpu()
+            state[f"{name}.lora_alpha"] = torch.tensor(
                 module.lora_alpha, dtype=torch.float32
             )
     return state
@@ -171,8 +175,15 @@ def extract_lora_weights(model):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
-    parser.add_argument("--metadata_file", type=str, required=True)
-    parser.add_argument("--train_data_dir", type=str, required=True)
+    parser.add_argument(
+        "--metadata_file",
+        type=str,
+        required=True,
+        help="Metadata CSV (e.g. HAM10000_metadata.csv).",
+    )
+    parser.add_argument(
+        "--train_data_dir", type=str, required=True, help="Folder with 512x512 images."
+    )
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--max_train_steps", type=int, default=1000)
@@ -212,15 +223,32 @@ def main():
 
     # Insert LoRA submodules into cross-attention layers of UNet
     for name, submodule in unet.named_modules():
-        if "attn" in name and hasattr(submodule, "to_q"):
-            for layer in [submodule.to_q, submodule.to_k, submodule.to_v]:
-                add_lora_to_linear(layer, rank=args.lora_rank, alpha=1.0)
+        if (
+            hasattr(submodule, "to_q")
+            and isinstance(submodule.to_q, torch.nn.Linear)
+            and hasattr(submodule, "to_k")
+            and isinstance(submodule.to_k, torch.nn.Linear)
+            and hasattr(submodule, "to_v")
+            and isinstance(submodule.to_v, torch.nn.Linear)
+        ):
+
+            def patch_linear_if_exists(layer):
+                if isinstance(layer, torch.nn.Linear):
+                    add_lora_to_linear(layer, rank=args.lora_rank, alpha=1.0)
+
+            patch_linear_if_exists(submodule.to_q)
+            patch_linear_if_exists(submodule.to_k)
+            patch_linear_if_exists(submodule.to_v)
             if hasattr(submodule, "to_out"):
-                if isinstance(submodule.to_out, torch.nn.Sequential):
-                    add_lora_to_linear(
-                        submodule.to_out[0], rank=args.lora_rank, alpha=1.0
-                    )
-                else:
+                if (
+                    isinstance(submodule.to_out, torch.nn.ModuleList)
+                    and len(submodule.to_out) > 0
+                ):
+                    if isinstance(submodule.to_out[0], torch.nn.Linear):
+                        add_lora_to_linear(
+                            submodule.to_out[0], rank=args.lora_rank, alpha=1.0
+                        )
+                elif isinstance(submodule.to_out, torch.nn.Linear):
                     add_lora_to_linear(submodule.to_out, rank=args.lora_rank, alpha=1.0)
 
     dataset = AllLesionDataset(
@@ -242,6 +270,11 @@ def main():
         if hasattr(mod, "lora_down") and hasattr(mod, "lora_up"):
             lora_params.append(mod.lora_down.weight)
             lora_params.append(mod.lora_up.weight)
+    if len(lora_params) == 0:
+        raise ValueError(
+            "No LoRA parameters found. Possibly no cross-attn layers found or code is incompatible."
+        )
+
     print(f"Found {len(lora_params)} LoRA param tensors in total.")
 
     optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
@@ -271,7 +304,6 @@ def main():
         except StopIteration:
             data_iter = iter(dataloader)
             batch = next(data_iter)
-
         with accelerator.accumulate(unet):
             pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
             input_ids = batch["input_ids"].to(device)
@@ -302,7 +334,7 @@ def main():
         if global_step >= max_train_steps:
             break
 
-    # Save LoRA weights
+    # --- Save only the LoRA weights ---
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
         lora_state_dict = extract_lora_weights(unet)
@@ -310,7 +342,7 @@ def main():
             lora_state_dict, os.path.join(args.output_dir, "lora_weights.safetensors")
         )
         print(
-            f"LoRA weights saved to: {os.path.join(args.output_dir, 'lora_weights.safetensors')}"
+            f"LoRA fine-tuning complete!\nLoRA-only weights saved to: {os.path.join(args.output_dir, 'lora_weights.safetensors')}"
         )
 
 
