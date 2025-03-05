@@ -12,11 +12,11 @@ Arguments:
   --pretrained_model_name_or_path : Path or identifier of the base Stable Diffusion model.
   --metadata_file                 : Path to the metadata CSV file.
   --target_label                  : Full target label for generation (e.g., "Dermatofibroma").
-  --lesion_code                   : Alternatively, a short lesion code (e.g., "df"). If provided and target_label is not,
-                                    the code is mapped via LABEL_MAP.
+  --lesion_code                   : Alternatively, a short lesion code (e.g., "df"); if provided and target_label is not,
+                                    it will be mapped via LABEL_MAP.
   --train_data_dir                : Directory containing all processed images.
   --output_dir                    : Where to save the generated synthetic images.
-  --lora_weights                  : (Optional) Path to the LoRA weights file (e.g., "pytorch_lora_weights.safetensors").
+  --lora_weights                  : (Optional) Path to the LoRA weights file (e.g., "adapter_model.safetensors").
   --guidance_scale                : Guidance scale for generation.
   --num_inference_steps           : Number of denoising steps.
   --strength                      : Strength of img2img transformation.
@@ -30,7 +30,7 @@ python generate_synthetic_images.py \
   --target_label="Dermatofibroma" \
   --train_data_dir="mlp-cw4/data/processed_sd/images" \
   --output_dir="mlp-cw4/data/synthetic/images_dermatofibroma" \
-  --lora_weights="models/stable_diffusion_lora/pytorch_lora_weights.safetensors" \
+  --lora_weights="models/stable_diffusion_lora/adapter_model.safetensors" \
   --guidance_scale=7.5 \
   --num_inference_steps=50 \
   --strength=0.8 \
@@ -92,7 +92,7 @@ def parse_args():
         "--lora_weights",
         type=str,
         default=None,
-        help="Path to the LoRA weights file (e.g., pytorch_lora_weights.safetensors)",
+        help="Path to the LoRA weights file (e.g., adapter_model.safetensors)",
     )
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -105,7 +105,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # If target_label is not provided, try to derive from lesion_code.
+    # If target_label is not provided, try to derive it from lesion_code.
     if args.target_label is None:
         if args.lesion_code is None:
             raise ValueError("You must supply either --target_label or --lesion_code.")
@@ -150,7 +150,8 @@ def main():
                 torch.load(lora_model_path, map_location="cpu"), strict=False
             )
         # Load the LoRA weights using LoraLoaderMixin.
-        LoraLoaderMixin.load_lora_into_unet(pipe.unet, args.lora_weights, alpha=1.0)
+        # Removed the alpha keyword because it is not expected.
+        LoraLoaderMixin.load_lora_into_unet(pipe.unet, args.lora_weights)
     else:
         print(
             "Warning: --lora_weights not provided or file does not exist; continuing with base UNet."
@@ -159,7 +160,6 @@ def main():
     pipe.unet.to(args.device, dtype=torch.float16)
 
     # 3) Generate synthetic images using img2img.
-    # Construct prompt from the target label.
     prompt = f"(skin lesion, {args.target_label})"
     for img_path in tqdm(image_files, desc="Generating synthetic images"):
         try:
