@@ -2,7 +2,12 @@ import os
 import argparse
 import torch
 from accelerate import Accelerator
-from diffusers import StableDiffusionPipeline, DDPMScheduler, UNet2DConditionModel
+from diffusers import (
+    StableDiffusionPipeline,
+    DDPMScheduler,
+    UNet2DConditionModel,
+    AutoencoderKL,
+)
 from transformers import CLIPTextModel, CLIPTokenizer
 from peft import LoraConfig, get_peft_model
 from tqdm import tqdm
@@ -145,9 +150,13 @@ def train_lora(
     # Load UNet
     unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
 
+    # Load VAE - THIS IS ESSENTIAL FOR PROPER LATENT ENCODING
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+
     # Freeze parameters
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
+    vae.requires_grad_(False)  # Make sure VAE is frozen
 
     # Configure LoRA for UNet
     unet_lora_config = LoraConfig(
@@ -170,7 +179,7 @@ def train_lora(
         text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
         text_encoder.train()
 
-    # Load the scheduler and vae
+    # Load the scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
     # Prepare dataset
@@ -209,12 +218,12 @@ def train_lora(
     optimizer = torch.optim.AdamW(params_to_optimize, lr=learning_rate)
 
     # Prepare everything for accelerator
-    if train_text_encoder:
-        unet, text_encoder, optimizer, dataloader = accelerator.prepare(
-            unet, text_encoder, optimizer, dataloader
-        )
-    else:
-        unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
+    unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
+
+    # Move text_encoder and vae to device for encoding (but not through accelerator since we don't train them)
+    device = accelerator.device
+    text_encoder.to(device)
+    vae.to(device)
 
     # Get total training steps
     num_update_steps_per_epoch = math.ceil(
@@ -240,8 +249,8 @@ def train_lora(
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(unet):
                 # Get input data
-                pixel_values = batch["pixel_values"]
-                input_ids = batch["input_ids"]
+                pixel_values = batch["pixel_values"].to(device)
+                input_ids = batch["input_ids"].to(device)
 
                 # Encode text
                 if train_text_encoder:
@@ -250,23 +259,29 @@ def train_lora(
                     with torch.no_grad():
                         encoder_hidden_states = text_encoder(input_ids)[0]
 
+                # Encode images to latent space using VAE
+                with torch.no_grad():
+                    latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
+
                 # Sample noise
-                noise = torch.randn_like(pixel_values)
-                bsz = pixel_values.shape[0]
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0,
                     noise_scheduler.config.num_train_timesteps,
                     (bsz,),
-                    device=pixel_values.device,
+                    device=latents.device,
                 ).long()
 
-                # Add noise to the clean images according to the noise magnitude at each timestep
-                noisy_images = noise_scheduler.add_noise(pixel_values, noise, timesteps)
+                # Add noise to the latents according to the noise magnitude at each timestep
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the model prediction
-                model_pred = unet(noisy_images, timesteps, encoder_hidden_states).sample
+                model_pred = unet(
+                    noisy_latents, timesteps, encoder_hidden_states
+                ).sample
 
                 # Calculate loss
                 loss = torch.nn.functional.mse_loss(model_pred, noise, reduction="mean")
@@ -297,7 +312,7 @@ def train_lora(
 
                 # Save Text Encoder LoRA weights and config if trained
                 if train_text_encoder:
-                    unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+                    unwrapped_text_encoder = text_encoder
                     unwrapped_text_encoder.save_pretrained(
                         os.path.join(ckpt_dir, "text_encoder_lora")
                     )
@@ -314,7 +329,7 @@ def train_lora(
 
         # Save Text Encoder LoRA weights and config if trained
         if train_text_encoder:
-            unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+            unwrapped_text_encoder = text_encoder
             unwrapped_text_encoder.save_pretrained(
                 os.path.join(epoch_dir, "text_encoder_lora")
             )
@@ -331,7 +346,7 @@ def train_lora(
 
     # Save Text Encoder LoRA weights and config if trained
     if train_text_encoder:
-        unwrapped_text_encoder = accelerator.unwrap_model(text_encoder)
+        unwrapped_text_encoder = text_encoder
         unwrapped_text_encoder.save_pretrained(
             os.path.join(final_dir, "text_encoder_lora")
         )
