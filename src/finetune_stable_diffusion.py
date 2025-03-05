@@ -161,12 +161,19 @@ class AllLesionDataset(Dataset):
 # Helper: Extract LoRA weights from UNet
 # -------------------------------------------------------------------
 def extract_lora_weights(model):
+    """
+    We prefix each name with "unet." so that diffusers'
+    StableDiffusionLoraLoaderMixin.load_lora_into_unet() can parse them.
+    """
     state = {}
     for name, module in model.named_modules():
         if hasattr(module, "lora_down") and hasattr(module, "lora_up"):
-            state[f"{name}.lora_down.weight"] = module.lora_down.weight.detach().cpu()
-            state[f"{name}.lora_up.weight"] = module.lora_up.weight.detach().cpu()
-            state[f"{name}.lora_alpha"] = torch.tensor(
+            unet_key = f"unet.{name}"
+            state[f"{unet_key}.lora_down.weight"] = (
+                module.lora_down.weight.detach().cpu()
+            )
+            state[f"{unet_key}.lora_up.weight"] = module.lora_up.weight.detach().cpu()
+            state[f"{unet_key}.lora_alpha"] = torch.tensor(
                 module.lora_alpha, dtype=torch.float32
             )
     return state
@@ -265,6 +272,7 @@ def main():
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
 
+    # Collect LoRA parameters (the only params that will be trained)
     lora_params = []
     for _, mod in unet.named_modules():
         if hasattr(mod, "lora_down") and hasattr(mod, "lora_up"):

@@ -27,18 +27,18 @@ Arguments:
   --device                        : "cuda" or "cpu" (default="cuda").
 
 Example Usage:
-python generate_synthetic_images.py \
-  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
-  --metadata_file="data/raw/HAM10000_metadata.csv" \
-  --lesion_code="df" \
-  --train_data_dir="data/processed_sd/images" \
-  --output_dir="data/synthetic/images_dermatofibroma" \
-  --lora_weights="models/stable_diffusion_lora/lora_weights.safetensors" \
-  --guidance_scale=7.5 \
-  --num_inference_steps=50 \
-  --strength=0.8 \
-  --num_images_per_prompt=10 \
-  --device="cuda"
+  python generate_synthetic_images.py \
+    --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+    --metadata_file="data/raw/HAM10000_metadata.csv" \
+    --lesion_code="df" \
+    --train_data_dir="data/processed_sd/images" \
+    --output_dir="data/synthetic/images_dermatofibroma" \
+    --lora_weights="models/stable_diffusion_lora/lora_weights.safetensors" \
+    --guidance_scale=7.5 \
+    --num_inference_steps=50 \
+    --strength=0.8 \
+    --num_images_per_prompt=10 \
+    --device="cuda"
 """
 
 import argparse
@@ -113,6 +113,7 @@ def main():
     metadata["full_label"] = (
         metadata["dx"].str.lower().map(lambda x: LABEL_MAP.get(x, x))
     )
+    # Filter for images matching the desired label:
     filtered = metadata[metadata["full_label"].str.lower() == args.target_label.lower()]
     image_ids = filtered["image_id"].tolist()
     image_files = [
@@ -124,25 +125,29 @@ def main():
         print(f"No images found for target label '{args.target_label}'. Exiting.")
         return
 
+    # Load base Img2Img pipeline
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch.float16,
         safety_checker=None,
     ).to(args.device)
 
-    # Custom LoRA loading: load the safetensors file and split keys into state_dict and network_alphas.
+    # Attempt to load LoRA weights if provided
     if args.lora_weights and os.path.exists(args.lora_weights):
         try:
             lora_dict = load_safetensors(args.lora_weights)
             network_alphas = {}
             state_dict = {}
+
+            # Separate alpha tensors from actual layer weights
             for k, v in lora_dict.items():
                 if k.endswith("lora_alpha"):
-                    # Remove trailing ".lora_alpha" (and any extra dot)
                     base_key = k[: -len("lora_alpha")].rstrip(".")
                     network_alphas[base_key] = v.item()
                 else:
                     state_dict[k] = v
+
+            # Use the diffusers LoRA loader
             StableDiffusionLoraLoaderMixin.load_lora_into_unet(
                 state_dict=state_dict, network_alphas=network_alphas, unet=pipe.unet
             )
@@ -155,6 +160,7 @@ def main():
         )
 
     pipe.unet.to(args.device, dtype=torch.float16)
+
     prompt = f"(skin lesion, {args.target_label})"
     print(f"Generating images with prompt: {prompt}")
 
@@ -166,6 +172,7 @@ def main():
         except Exception as e:
             print(f"Error loading {img_path}: {e}")
             continue
+
         base_name = os.path.splitext(os.path.basename(img_path))[0]
         for i in range(args.num_images_per_prompt):
             result = pipe(
@@ -178,6 +185,7 @@ def main():
             gen_image = result.images[0]
             out_fname = f"{base_name}_synthetic_{i}.png"
             gen_image.save(os.path.join(args.output_dir, out_fname))
+
     print(f"Done. Synthetic images saved in '{args.output_dir}'.")
 
 
