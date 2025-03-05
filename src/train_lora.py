@@ -6,7 +6,7 @@ train_lora.py
 
 Trains LoRA on a Stable Diffusion model for the entire HAM10000 dataset.
 Each image (from a single folder) is paired with a prompt derived from its lesion label
-in HAM10000_metadata.csv. Only the LoRA parameters injected into the UNet’s cross-attention
+in HAM10000_metadata.csv. Only the LoRA parameters injected into the UNet's cross-attention
 layers are updated while the rest of the model remains frozen.
 
 Example usage:
@@ -182,7 +182,8 @@ def main():
     )
     logger.info(args)
     accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="no",  # Changed from auto (default) to "no" to avoid type mismatches
     )
     set_seed(args.seed)
 
@@ -264,11 +265,11 @@ def main():
     )
     unet.train()
 
-    # 9) Move VAE and text_encoder to device in FP16.
+    # 9) Move VAE and text_encoder to device.
     device = accelerator.device
-    vae.to(device, dtype=torch.float16)
-    text_encoder.to(device, dtype=torch.float16)
-    # Note: unet is already handled by accelerator.
+    # Don't force float16 for these models
+    vae.to(device)
+    text_encoder.to(device)
 
     global_step = 0
     progress_bar = tqdm(range(max_steps), disable=not accelerator.is_local_main_process)
@@ -280,14 +281,15 @@ def main():
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
 
-        pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
+        # Make sure pixel_values are in full precision (float32)
+        pixel_values = batch["pixel_values"].to(device)
         prompts = batch["prompt"]
 
         with accelerator.accumulate(unet):
             # i) Convert images to latents using VAE.
             with torch.no_grad():
-                # Cast input to half precision.
-                latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
+                # Keep in full precision
+                latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
 
             # ii) Sample noise and timesteps.
             noise = torch.randn_like(latents)
