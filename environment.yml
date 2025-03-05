@@ -11,6 +11,7 @@ dependencies:
   - pip # Ensure pip is available
   - pip:
       - kaggle
+      - torch>=2.0
       - peft
       - timm
       - diffusers[torch]>=0.14 # Ensure diffusers installs with torch compatibility
