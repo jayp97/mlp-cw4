@@ -25,7 +25,8 @@ import argparse
 import os
 import torch
 import json
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+import re
+from diffusers import StableDiffusionPipeline
 from tqdm.auto import tqdm
 from PIL import Image
 
@@ -91,84 +92,95 @@ def parse_args():
     return parser.parse_args()
 
 
-def inject_lora_into_unet(unet, lora_weights, scale=1.0):
-    """
-    Directly inject LoRA weights into UNet model by modifying forward methods.
-    This approach bypasses the need for specific attention processor modules.
-    """
+class LoRAModuleInjector:
+    """Injects LoRA layers into existing linear modules."""
+
+    def __init__(self, linear_module, lora_up, lora_down, scale=1.0):
+        self.linear_module = linear_module
+        self.lora_up = lora_up
+        self.lora_down = lora_down
+        self.scale = scale
+
+        # Save the original forward method
+        self.original_forward = linear_module.forward
+
+        # Replace the forward method with our custom one
+        def lora_forward(x):
+            # Original output
+            original_output = self.original_forward(x)
+
+            # LoRA path: x -> down -> up
+            # Preserve original shape
+            orig_shape = x.shape
+            # Reshape for matrix multiplication if needed
+            if len(x.shape) > 2:
+                x_2d = x.reshape(-1, x.shape[-1])
+            else:
+                x_2d = x
+            # Down projection
+            down_output = torch.mm(x_2d, self.lora_down.T.to(x.device))
+            # Up projection
+            up_output = torch.mm(down_output, self.lora_up.T.to(x.device))
+            # Reshape back
+            if len(orig_shape) > 2:
+                lora_output = up_output.reshape(
+                    orig_shape[:-1] + (self.lora_up.shape[0],)
+                )
+            else:
+                lora_output = up_output
+
+            # Scale and add to original output
+            scaled_output = lora_output * self.scale
+
+            # Check if shapes match
+            if original_output.shape == scaled_output.shape:
+                return original_output + scaled_output
+            else:
+                print(
+                    f"Shape mismatch: original {original_output.shape}, lora {scaled_output.shape}"
+                )
+                return original_output
+
+        # Replace the forward method
+        linear_module.forward = lora_forward
+
+
+def apply_direct_lora(model, lora_state_dict, scale=1.0):
+    """Apply LoRA weights directly to linear layers in the model."""
     print(f"Applying LoRA weights with scale {scale}...")
 
-    # Parse module name format from the LoRA weights
-    modules_to_modify = {}
-    for key in lora_weights:
-        parts = key.split("|")
-        if len(parts) != 2:
-            continue
+    # Track which modules we've modified
+    modified_modules = set()
 
-        module_name = parts[0]
-        param_name = parts[1]
+    # Find all Linear layers in the model
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            module_up_key = None
+            module_down_key = None
 
-        if module_name not in modules_to_modify:
-            modules_to_modify[module_name] = {}
+            # Try to match this module with LoRA weights by name pattern
+            for key in lora_state_dict.keys():
+                if "up" in key and name.replace(".", "_") in key:
+                    module_up_key = key
+                if "down" in key and name.replace(".", "_") in key:
+                    module_down_key = key
 
-        modules_to_modify[module_name][param_name] = lora_weights[key]
+            # If we found matching weights, apply LoRA
+            if module_up_key and module_down_key:
+                up_weight = lora_state_dict[module_up_key]
+                down_weight = lora_state_dict[module_down_key]
 
-    print(f"Found {len(modules_to_modify)} modules to modify")
+                # Check if dimensions are compatible
+                if (
+                    up_weight.shape[0] == module.out_features
+                    and down_weight.shape[1] == module.in_features
+                ):
+                    # Inject LoRA
+                    LoRAModuleInjector(module, up_weight, down_weight, scale)
+                    modified_modules.add(name)
 
-    # Modify each module with LoRA weights
-    modules_modified = 0
-    for module_path, module_weights in modules_to_modify.items():
-        # Get the module from the UNet
-        module = unet
-        for name in module_path.split("."):
-            if not hasattr(module, name):
-                print(f"Warning: Could not find module at path {module_path}")
-                break
-            module = getattr(module, name)
-        else:
-            # Successfully accessed the module, now modify its forward method
-            if "up" in module_weights and "down" in module_weights:
-                # Get original forward method
-                orig_forward = module.forward
-
-                # Apply LoRA weights through a new forward method
-                def make_lora_forward(orig_func, up_weight, down_weight, scale):
-                    def lora_forward(x, *args, **kwargs):
-                        # Call original forward
-                        result = orig_func(x, *args, **kwargs)
-
-                        # Apply LoRA: (x @ down_weight.T) @ up_weight.T
-                        # First reshape x for matrix multiplication
-                        x_reshaped = x.reshape(-1, x.shape[-1])
-
-                        # Apply down projection
-                        down_projection = torch.matmul(
-                            x_reshaped, down_weight.t().to(x.device)
-                        )
-
-                        # Apply up projection
-                        up_projection = torch.matmul(
-                            down_projection, up_weight.t().to(x.device)
-                        )
-
-                        # Reshape back to original shape and scale
-                        lora_output = up_projection.reshape(result.shape) * scale
-
-                        # Add LoRA output to the original output
-                        return result + lora_output
-
-                    return lora_forward
-
-                # Replace the forward method
-                up_weight = module_weights["up.weight"]
-                down_weight = module_weights["down.weight"]
-                module.forward = make_lora_forward(
-                    orig_forward, up_weight, down_weight, scale
-                )
-                modules_modified += 1
-
-    print(f"Successfully modified {modules_modified} modules")
-    return modules_modified > 0
+    print(f"Successfully modified {len(modified_modules)} modules with direct LoRA")
+    return len(modified_modules) > 0
 
 
 def main():
@@ -183,7 +195,7 @@ def main():
     prompt = f"A photo of a {label_text} lesion"
     print(f"Using prompt: '{prompt}'")
 
-    # 1) Load the Stable Diffusion pipeline in FP16.
+    # 1) Load the Stable Diffusion pipeline
     print(f"Loading base model: {args.pretrained_model}")
     pipe = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model,
@@ -191,14 +203,14 @@ def main():
         safety_checker=None,  # Disable safety checker for faster loading
     ).to("cuda")
 
-    # Use DDIM scheduler for better quality
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-
     # 2) Load and apply LoRA weights
     if os.path.exists(args.lora_weights):
         print(f"Loading LoRA weights from {args.lora_weights}...")
         try:
-            lora_state_dict = torch.load(args.lora_weights, map_location="cpu")
+            # Load with weights_only=True to avoid pickle warning
+            lora_state_dict = torch.load(
+                args.lora_weights, map_location="cpu", weights_only=True
+            )
             print(f"Loaded {len(lora_state_dict)} LoRA parameter entries")
 
             # Look for adapter_config.json in the same directory
@@ -210,8 +222,8 @@ def main():
                     adapter_config = json.load(f)
                     print(f"Loaded adapter config: {adapter_config}")
 
-            # Apply LoRA weights by directly modifying modules
-            success = inject_lora_into_unet(
+            # Apply LoRA directly to linear layers
+            success = apply_direct_lora(
                 pipe.unet, lora_state_dict, scale=args.lora_scale
             )
             if not success:
@@ -219,6 +231,9 @@ def main():
                 print("Continuing with base model only")
         except Exception as e:
             print(f"Error applying LoRA weights: {e}")
+            import traceback
+
+            traceback.print_exc()
             print("Continuing with base model only")
     else:
         print(f"WARNING: LoRA weights not found at {args.lora_weights}")
@@ -227,15 +242,20 @@ def main():
     # 3) Setup a random generator for reproducibility.
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
 
-    # 4) Generate and save images.
+    # 4) Generate and save images one by one.
     print(f"Generating {args.num_images} images...")
-    for i in tqdm(range(args.num_images)):
+    for i in range(args.num_images):
+        print(f"Generating image {i+1}/{args.num_images}...")
+
+        # Generate image
         output = pipe(
             prompt=prompt,
             guidance_scale=args.guidance_scale,
             num_inference_steps=args.num_inference_steps,
             generator=generator,
         )
+
+        # Save image
         image = output.images[0]
         filename = f"{args.lesion_code}_synthetic_{i:03d}.png"
         out_path = os.path.join(args.output_dir, filename)
