@@ -1,58 +1,66 @@
 #!/usr/bin/env python
 # coding=utf-8
 """
-generate_synthetic_images.py
+finetune_stable_diffusion.py
 
-Generates synthetic skin lesion images for a given target label using a fine-tuned
-Stable Diffusion model (with LoRA) and the learned/fine-tuned model.
-At generation time you specify either:
-  --target_label="Dermatofibroma"
-or
-  --lesion_code="df"   (which maps to "Dermatofibroma" via LABEL_MAP)
+LoRA fine-tuning on the entire dataset (all labels), using
+a manual LoRA injection approach for cross-attention sub-layers.
 
-The script filters the metadata CSV to find all images matching that label, then uses
-each image as an init_image in an img2img pipeline to produce synthetic images.
+We do NOT rely on AttnProcessor(2_0) having parameters, because in
+modern diffusers versions, the default attention processors (like
+AttnProcessor2_0) are parameter-free. Instead, we manually insert LoRA
+down/up submodules into each cross-attention linear layer (to_q, to_k,
+to_v, to_out).
 
-Arguments:
-  --pretrained_model_name_or_path : Base Stable Diffusion model (e.g. "runwayml/stable-diffusion-v1-5").
-  --metadata_file                 : Path to a CSV with at least columns [image_id, dx].
-  --target_label                  : Full target label (e.g., "Dermatofibroma").
-  --lesion_code                   : Alternatively, a short code (e.g., "df"); if target_label is not given, it will be mapped.
-  --train_data_dir                : Folder with 512x512 images (no subfolders).
-  --output_dir                    : Folder where the generated synthetic images will be saved.
-  --lora_weights                  : (Optional) Path to the LoRA weights file (e.g., "diffusion_pytorch_model.safetensors").
-  --guidance_scale                : Guidance scale for generation (default=7.5).
-  --num_inference_steps           : Number of denoising steps (default=50).
-  --strength                      : Strength for the img2img transformation (default=0.8).
-  --num_images_per_prompt         : Number of synthetic images to generate per input image (default=5).
-  --device                        : "cuda" or "cpu" (default="cuda").
+No manual lesion code or placeholder token is needed. We create prompts
+like "(skin lesion, {full_label})" from the metadata CSV for each image.
+
+----------------------------------------
+Requirements:
+  - diffusers >= 0.14
+  - accelerate
+  - safetensors
+  - torch
+----------------------------------------
 
 Example Usage:
-python generate_synthetic_images.py \
-  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
-  --metadata_file="data/raw/HAM10000_metadata.csv" \
-  --lesion_code="df" \
-  --train_data_dir="data/processed_sd/images" \
-  --output_dir="data/synthetic/images_dermatofibroma" \
-  --lora_weights="models/stable_diffusion_lora/diffusion_pytorch_model.safetensors" \
-  --guidance_scale=7.5 \
-  --num_inference_steps=50 \
-  --strength=0.8 \
-  --num_images_per_prompt=10 \
-  --device="cuda"
+  python finetune_stable_diffusion.py \
+    --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+    --metadata_file="data/raw/HAM10000_metadata.csv" \
+    --train_data_dir="data/processed_sd/images" \
+    --resolution=512 \
+    --learning_rate=5e-5 \
+    --max_train_steps=1000 \
+    --batch_size=1 \
+    --lora_rank=4 \
+    --seed=42 \
+    --output_dir="models/stable_diffusion_lora"
+
+After completion, the fine-tuned LoRA adapters are saved into
+--output_dir (which will contain the UNet with the LoRA hooks).
 """
 
 import argparse
 import os
-import torch
-from PIL import Image
-from tqdm.auto import tqdm
-from diffusers import StableDiffusionImg2ImgPipeline
-from diffusers.loaders import LoraLoaderMixin
-import pandas as pd
-from safetensors.torch import load_file as safe_load_file
 
-# Mapping from short lesion codes to full labels.
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+
+from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers.optimization import get_scheduler
+from transformers import CLIPTextModel, CLIPTokenizer
+
+# -------------------------------------------------------------------
+# MAPPING: short lesion codes -> full textual label for prompts
+# -------------------------------------------------------------------
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -64,126 +72,332 @@ LABEL_MAP = {
 }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
-    parser.add_argument(
-        "--metadata_file", type=str, required=True, help="Path to metadata CSV file"
-    )
-    parser.add_argument(
-        "--target_label",
-        type=str,
-        default=None,
-        help="Full target label for generation (e.g., 'Dermatofibroma')",
-    )
-    parser.add_argument(
-        "--lesion_code",
-        type=str,
-        default=None,
-        help="Short lesion code (e.g., 'df'); if provided and target_label is not, it will be mapped to the full label.",
-    )
-    parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        required=True,
-        help="Directory containing all processed images",
-    )
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument(
-        "--lora_weights",
-        type=str,
-        default=None,
-        help="Path to the LoRA weights file (e.g., diffusion_pytorch_model.safetensors)",
-    )
-    parser.add_argument("--guidance_scale", type=float, default=7.5)
-    parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--strength", type=float, default=0.8)
-    parser.add_argument("--num_images_per_prompt", type=int, default=5)
-    parser.add_argument("--device", type=str, default="cuda")
-    return parser.parse_args()
+# -------------------------------------------------------------------
+# LoRA Hook: We'll define a forward_pre_hook to add LoRA's contribution
+# -------------------------------------------------------------------
+def lora_forward_pre_hook(module, input):
+    """
+    We intercept the forward pass of the original linear layer.
+    'module' has lora_down and lora_up, each a small linear layer.
+    input is a tuple of (x, ) i.e. the input tensor(s).
+    """
+    x = input[0]  # The original input to the linear layer
+    # The standard (original) forward output:
+    out_normal = module.original_forward(x)
+
+    # The LoRA forward pass: out_lora = lora_up( lora_down( x ) )
+    # Then scaled by module.lora_alpha, typically 1.0
+    out_lora = module.lora_up(module.lora_down(x)) * module.lora_alpha
+
+    return (out_normal + out_lora,)
+
+
+def add_lora_to_linear(linear_layer, rank=4, alpha=1.0):
+    """
+    Insert LoRA submodules (lora_down, lora_up) into the given linear_layer.
+    We'll attach a forward_pre_hook so that:
+      out = original_forward(x) + alpha * lora_up(lora_down(x))
+    """
+    if not isinstance(linear_layer, torch.nn.Linear):
+        return
+
+    # 1) Create LoRA down & up
+    in_features = linear_layer.in_features
+    out_features = linear_layer.out_features
+
+    lora_down = torch.nn.Linear(in_features, rank, bias=False)
+    lora_up = torch.nn.Linear(rank, out_features, bias=False)
+
+    # 2) Zero init so that they start as no-op
+    torch.nn.init.zeros_(lora_down.weight)
+    torch.nn.init.zeros_(lora_up.weight)
+
+    # 3) Convert them to the same dtype as the parent's weight
+    #    to avoid half-vs-float mismatches
+    lora_down = lora_down.to(linear_layer.weight.dtype)
+    lora_up = lora_up.to(linear_layer.weight.dtype)
+
+    # 4) Attach them
+    linear_layer.lora_down = lora_down
+    linear_layer.lora_up = lora_up
+    linear_layer.lora_alpha = alpha
+
+    # 5) Overwrite forward with a forward_pre_hook so we can do:
+    #    y = original_forward(x) + lora_up(lora_down(x)) * alpha
+    if not hasattr(linear_layer, "original_forward"):
+        linear_layer.original_forward = linear_layer.forward
+
+        def dummy_forward(x):
+            # The real logic is in the forward_pre_hook
+            return x
+
+        linear_layer.forward = dummy_forward
+
+    # 6) Register the hook once
+    if not getattr(linear_layer, "_lora_hook_registered", False):
+        linear_layer.register_forward_pre_hook(lora_forward_pre_hook)
+        linear_layer._lora_hook_registered = True
+
+
+# -------------------------------------------------------------------
+# Our dataset class (full dataset, all labels)
+# -------------------------------------------------------------------
+class AllLesionDataset(Dataset):
+    """
+    For each row in the metadata, we load the image and build a prompt:
+       (skin lesion, {full_label})
+    Where full_label is the full text from LABEL_MAP or the dx if missing.
+    """
+
+    def __init__(self, data_root, metadata_file, resolution, tokenizer):
+        self.data_root = data_root
+        self.metadata = pd.read_csv(metadata_file)
+        self.resolution = resolution
+        self.tokenizer = tokenizer
+        self._length = len(self.metadata)
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        image_id = row["image_id"]
+        dx_code = str(row["dx"]).lower().strip()
+        full_label = LABEL_MAP.get(dx_code, dx_code)
+        prompt = f"(skin lesion, {full_label})"
+
+        # Tokenize prompt for conditioning
+        tokenized_text = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids[0]
+
+        # Load image
+        img_path = os.path.join(self.data_root, f"{image_id}.jpg")
+        image = Image.open(img_path).convert("RGB")
+        image = image.resize((self.resolution, self.resolution), Image.BICUBIC)
+        arr = np.array(image).astype(np.uint8)
+        arr = (arr / 127.5 - 1.0).astype(np.float32)
+        tensor = torch.from_numpy(arr).permute(2, 0, 1)
+
+        return {"pixel_values": tensor, "input_ids": tokenized_text}
 
 
 def main():
-    args = parse_args()
-
-    # If target_label is not provided, derive it from lesion_code.
-    if not args.target_label:
-        if not args.lesion_code:
-            raise ValueError("You must supply either --target_label or --lesion_code.")
-        args.target_label = LABEL_MAP.get(args.lesion_code.lower(), args.lesion_code)
-        print(f"Derived target_label from lesion_code: {args.target_label}")
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Read the metadata CSV and filter for rows where full_label matches target_label.
-    metadata = pd.read_csv(args.metadata_file)
-    metadata["full_label"] = (
-        metadata["dx"].str.lower().map(lambda x: LABEL_MAP.get(x, x))
+    # ----------------------------------------------------------------
+    # Parse args, set up Accelerator, fix random seeds
+    # ----------------------------------------------------------------
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pretrained_model_name_or_path", type=str, required=True)
+    parser.add_argument(
+        "--metadata_file",
+        type=str,
+        required=True,
+        help="Metadata CSV (e.g. HAM10000_metadata.csv).",
     )
-    filtered = metadata[metadata["full_label"].str.lower() == args.target_label.lower()]
-    image_ids = filtered["image_id"].tolist()
-    image_files = [
-        os.path.join(args.train_data_dir, f"{img_id}.jpg")
-        for img_id in image_ids
-        if os.path.exists(os.path.join(args.train_data_dir, f"{img_id}.jpg"))
-    ]
-    if not image_files:
-        print(f"No images found for target label '{args.target_label}'. Exiting.")
-        return
+    parser.add_argument(
+        "--train_data_dir", type=str, required=True, help="Folder with 512x512 images."
+    )
+    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--max_train_steps", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--lora_rank", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--output_dir", type=str, default="./output/stable_diffusion_lora"
+    )
 
-    # 1) Load the Stable Diffusion img2img pipeline.
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        torch_dtype=torch.float16,
-        safety_checker=None,  # Safety checker disabled per user request.
-    ).to(args.device)
+    args = parser.parse_args()
+    accelerator = Accelerator()
+    set_seed(args.seed)
 
-    # 2) Load fine-tuned LoRA weights if provided.
-    if args.lora_weights and os.path.exists(args.lora_weights):
-        try:
-            # Load the LoRA state dictionary from the safetensors file.
-            state_dict = safe_load_file(args.lora_weights, device="cpu")
-            # Build a network_alphas dictionary: assign a default alpha (e.g., 1.0) for each key.
-            network_alphas = {key: 1.0 for key in state_dict.keys()}
-            # Load the LoRA layers into the UNet using the new signature.
-            LoraLoaderMixin.load_lora_into_unet(
-                state_dict, network_alphas, unet=pipe.unet
-            )
-            print(f"Loaded LoRA weights from {args.lora_weights}")
-        except Exception as e:
-            print(f"Error loading LoRA weights: {e}")
-    else:
-        print(
-            "Warning: --lora_weights not provided or file does not exist; using base UNet."
+    # ----------------------------------------------------------------
+    # 1) Load the base SD components (tokenizer, text encoder, VAE, UNet)
+    # ----------------------------------------------------------------
+    tokenizer = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="tokenizer"
+    )
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder"
+    )
+    # Freeze text encoder (not training it)
+    for param in text_encoder.parameters():
+        param.requires_grad = False
+
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae"
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet"
+    )
+    # freeze original
+    vae.requires_grad_(False)
+    unet.requires_grad_(False)
+
+    # move them to half & device
+    device = accelerator.device
+    vae.to(device, dtype=torch.float16)
+    unet.to(device, dtype=torch.float16)
+    text_encoder.to(device, dtype=torch.float16)
+
+    # ----------------------------------------------------------------
+    # 2) Insert LoRA submodules into cross-attn layers
+    # We'll search through unet.named_modules() to find submodules with to_q, to_k, to_v
+    # Then we add LoRA to each of those linear layers
+    # ----------------------------------------------------------------
+    for name, submodule in unet.named_modules():
+        if (
+            hasattr(submodule, "to_q")
+            and isinstance(submodule.to_q, torch.nn.Linear)
+            and hasattr(submodule, "to_k")
+            and isinstance(submodule.to_k, torch.nn.Linear)
+            and hasattr(submodule, "to_v")
+            and isinstance(submodule.to_v, torch.nn.Linear)
+        ):
+            # Add LoRA to submodule.to_q, submodule.to_k, submodule.to_v, and submodule.to_out
+            def patch_linear_if_exists(layer):
+                if isinstance(layer, torch.nn.Linear):
+                    add_lora_to_linear(layer, rank=args.lora_rank, alpha=1.0)
+
+            patch_linear_if_exists(submodule.to_q)
+            patch_linear_if_exists(submodule.to_k)
+            patch_linear_if_exists(submodule.to_v)
+
+            if hasattr(submodule, "to_out"):
+                # to_out can be a (linear, dropout) in a list or a single linear
+                if (
+                    isinstance(submodule.to_out, torch.nn.ModuleList)
+                    and len(submodule.to_out) > 0
+                ):
+                    # typically [nn.Linear, nn.Dropout], so we patch submodule.to_out[0]
+                    if isinstance(submodule.to_out[0], torch.nn.Linear):
+                        add_lora_to_linear(
+                            submodule.to_out[0], rank=args.lora_rank, alpha=1.0
+                        )
+                elif isinstance(submodule.to_out, torch.nn.Linear):
+                    # direct linear
+                    add_lora_to_linear(submodule.to_out, rank=args.lora_rank, alpha=1.0)
+
+    # ----------------------------------------------------------------
+    # 3) Create dataset & dataloader
+    # ----------------------------------------------------------------
+    dataset = AllLesionDataset(
+        data_root=args.train_data_dir,
+        metadata_file=args.metadata_file,
+        resolution=args.resolution,
+        tokenizer=tokenizer,
+    )
+    dataloader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+    )
+
+    # ----------------------------------------------------------------
+    # 4) Create noise scheduler & gather LoRA parameters
+    # ----------------------------------------------------------------
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler"
+    )
+
+    # gather LoRA parameters by scanning for lora_down/lora_up
+    lora_params = []
+    for _, mod in unet.named_modules():
+        if hasattr(mod, "lora_down") and hasattr(mod, "lora_up"):
+            # each is a linear
+            lora_params.append(mod.lora_down.weight)
+            lora_params.append(mod.lora_up.weight)
+
+    if len(lora_params) == 0:
+        raise ValueError(
+            "No LoRA parameters found. Possibly no cross-attn layers found, or code is incompatible with your diffusers version."
         )
+    print(f"Found {len(lora_params)} LoRA param tensors in total.")
 
-    pipe.unet.to(args.device, dtype=torch.float16)
+    # Create optimizer & lr scheduler
+    optimizer = torch.optim.AdamW(lora_params, lr=args.learning_rate)
+    max_train_steps = args.max_train_steps
+    lr_scheduler = get_scheduler(
+        "constant",
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=max_train_steps,
+    )
 
-    # 3) Generate synthetic images using img2img.
-    prompt = f"(skin lesion, {args.target_label})"
-    for img_path in tqdm(image_files, desc="Generating synthetic images"):
-        try:
-            init_img = (
-                Image.open(img_path).convert("RGB").resize((512, 512), Image.BICUBIC)
+    # Prepare with Accelerator
+    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, dataloader, lr_scheduler
+    )
+    unet.train()
+    vae.eval()
+    text_encoder.eval()
+
+    # ----------------------------------------------------------------
+    # 5) Fine-tuning loop
+    # ----------------------------------------------------------------
+    global_step = 0
+    progress_bar = tqdm(
+        range(max_train_steps), disable=not accelerator.is_local_main_process
+    )
+
+    for step in range(max_train_steps):
+        # fetch batch
+        batch = next(
+            iter(dataloader)
+        )  # simpler than for loop with StopIteration handling
+        with accelerator.accumulate(unet):
+            pixel_values = batch["pixel_values"].to(device, dtype=torch.float32)
+            input_ids = batch["input_ids"].to(device)
+
+            # 1) encode images to latents
+            with torch.no_grad():
+                latents = vae.encode(pixel_values.half()).latent_dist.sample() * 0.18215
+
+            # 2) sample random noise
+            noise = torch.randn_like(latents)
+            bsz = latents.shape[0]
+
+            # 3) random timesteps
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=device,
+                dtype=torch.long,
             )
-        except Exception as e:
-            print(f"Error loading {img_path}: {e}")
-            continue
+            # 4) add noise
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-        base_name = os.path.splitext(os.path.basename(img_path))[0]
-        for i in range(args.num_images_per_prompt):
-            result = pipe(
-                prompt=prompt,
-                image=init_img,
-                strength=args.strength,
-                guidance_scale=args.guidance_scale,
-                num_inference_steps=args.num_inference_steps,
-            )
-            gen_image = result.images[0]
-            out_fname = f"{base_name}_synthetic_{i}.png"
-            gen_image.save(os.path.join(args.output_dir, out_fname))
+            # 5) text encoder forward
+            with torch.no_grad():
+                text_out = text_encoder(input_ids=input_ids)
+                encoder_hidden_states = text_out[0].half()
 
-    print(f"Done. Synthetic images saved in '{args.output_dir}'.")
+            # 6) U-Net forward to predict noise
+            noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+
+            # 7) Backprop
+            accelerator.backward(loss)
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+        progress_bar.update(1)
+        progress_bar.set_postfix({"loss": loss.item()})
+        global_step += 1
+        if global_step >= max_train_steps:
+            break
+
+    # ----------------------------------------------------------------
+    # 6) Save final LoRA fine-tuned model
+    # ----------------------------------------------------------------
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        unet.save_pretrained(args.output_dir)
+        print(f"LoRA fine-tuning complete. Model saved to {args.output_dir}")
 
 
 if __name__ == "__main__":
