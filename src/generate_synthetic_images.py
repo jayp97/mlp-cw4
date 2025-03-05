@@ -100,62 +100,58 @@ def main():
     ).to("cuda")
 
     # 2) Load the LoRA weights with adapter name
-    try:
-        # First try standard loading
-        pipe.load_lora_weights(
+    # Try multiple loading methods
+    loading_methods = [
+        # Method 1: Direct loading with attn_procs
+        lambda: pipe.unet.load_attn_procs(args.lora_weights),
+        # Method 2: Using load_lora_weights with the directory and filename
+        lambda: pipe.load_lora_weights(
             os.path.dirname(args.lora_weights),
             weight_name=os.path.basename(args.lora_weights),
-        )
-    except ValueError as e:
-        print(f"Standard loading failed: {e}. Trying alternative loading method...")
-        # If that fails, try loading as a standalone file
-        from safetensors.torch import load_file
+        ),
+        # Method 3: Load directly as adapter
+        lambda: pipe.unet.load_lora_weights(args.lora_weights),
+    ]
 
-        # Load the weights
-        state_dict = load_file(args.lora_weights)
+    # Try each method until one works
+    for i, load_method in enumerate(loading_methods):
+        try:
+            print(f"Trying LoRA loading method {i+1}...")
+            load_method()
+            print(f"Successfully loaded LoRA weights using method {i+1}")
+            break
+        except Exception as e:
+            print(f"Method {i+1} failed: {e}")
+            if i == len(loading_methods) - 1:
+                # If all methods fail, use a very simple approach
+                print("All loading methods failed. Using fallback approach.")
+                try:
+                    from safetensors.torch import load_file
 
-        # Manually apply the weights to the UNet
-        # This is a fallback approach for custom saved LoRA weights
-        print("Manually applying LoRA weights...")
+                    weights = load_file(args.lora_weights)
+                    print(f"Loaded weights with keys: {list(weights.keys())[:5]}...")
 
-        for key, value in state_dict.items():
-            # Skip metadata and config keys
-            if key.startswith("peft_config") or not key.startswith("lora."):
-                continue
+                    # Create a simple LoRA processor and apply directly
+                    from diffusers.models.attention_processor import LoRAAttnProcessor
 
-            # Parse the key to find the target module and parameter
-            parts = key.split(".")
-            if len(parts) < 4:
-                continue
+                    rank = 4  # Default rank if not specified
+                    for key, value in weights.items():
+                        if key.endswith("alpha"):
+                            # If we have alpha values, use them to determine rank
+                            rank = int(value.item())
+                            break
 
-            direction = parts[1]  # 'up' or 'down'
-            module_path = parts[2]  # The module path with underscores
-            param_name = parts[3]  # Usually 'weight'
+                    print(f"Using rank {rank} for LoRA")
+                    pipe.unet.set_attn_processor(LoRAAttnProcessor(rank=rank))
 
-            # Convert underscores back to dots for module lookup
-            module_path = module_path.replace("_", ".")
-
-            # Find the matching module
-            target_found = False
-            for name, module in pipe.unet.named_modules():
-                if name.endswith(module_path):
-                    if hasattr(module, "lora_layer"):
-                        # Use existing lora layer
-                        if direction == "up" and hasattr(module.lora_layer, "up"):
-                            module.lora_layer.up.weight.copy_(value)
-                            target_found = True
-                        elif direction == "down" and hasattr(module.lora_layer, "down"):
-                            module.lora_layer.down.weight.copy_(value)
-                            target_found = True
-                    elif direction in ["up", "down"]:
-                        # Need to inject a new LoRA layer
-                        # This is a simplified version - in practice you'd need proper layer creation
-                        print(f"Would need to inject LoRA layer into {name}")
-
-            if not target_found:
-                print(f"Could not find target for {key}")
-
-        print("Manual loading completed")
+                    # Now try to load the weights into the attn processor
+                    pipe.unet.load_attn_procs(args.lora_weights, use_safetensors=True)
+                    print("Applied basic LoRA attention processor")
+                except Exception as final_e:
+                    print(f"Final fallback failed: {final_e}")
+                    print(
+                        "WARNING: Proceeding without LoRA weights, results may not be as expected"
+                    )
 
     # 3) Setup a random generator for reproducibility.
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
