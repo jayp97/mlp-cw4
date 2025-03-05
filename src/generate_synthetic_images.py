@@ -4,9 +4,9 @@
 generate_synthetic_images.py
 
 Generates synthetic skin lesion images for a given target label using the fine-tuned
-Stable Diffusion model (with LoRA) and the learned textual inversion (or fine-tuned) model.
-At generation time you specify the target label (e.g., "Dermatofibroma") and the script
-filters the metadata CSV to select initial images of that label.
+Stable Diffusion model (with LoRA) and the learned/fine-tuned model.
+At generation time you specify the target label (e.g., "Dermatofibroma") or a lesion code (e.g., "df")
+and the script filters the metadata CSV to select initial images of that label.
 
 Example Usage:
 python generate_synthetic_images.py \
@@ -20,7 +20,10 @@ python generate_synthetic_images.py \
   --strength=0.8 \
   --num_images_per_prompt=5 \
   --device="cuda"
+  
+Alternatively, you can supply --lesion_code (e.g., "df") in place of --target_label.
 """
+
 import argparse
 import os
 import torch
@@ -31,7 +34,7 @@ from diffusers.loaders import LoraLoaderMixin
 from safetensors.torch import safe_open
 import pandas as pd
 
-# Same LABEL_MAP used during training.
+# Mapping from short lesion codes to full labels.
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -49,11 +52,19 @@ def parse_args():
     parser.add_argument(
         "--metadata_file", type=str, required=True, help="Path to metadata CSV file"
     )
+    # New argument --target_label; not required if --lesion_code is provided.
     parser.add_argument(
         "--target_label",
         type=str,
-        required=True,
+        default=None,
         help="The full target label for generation (e.g., 'Dermatofibroma')",
+    )
+    # Alias for target_label; if provided, will be mapped via LABEL_MAP.
+    parser.add_argument(
+        "--lesion_code",
+        type=str,
+        default=None,
+        help="Short lesion code (e.g., 'df'); if provided and target_label is not, it will be mapped to the full label.",
     )
     parser.add_argument(
         "--train_data_dir",
@@ -72,11 +83,22 @@ def parse_args():
 
 def main():
     args = parse_args()
+    # If target_label is not supplied, try to use lesion_code to derive it.
+    if args.target_label is None:
+        if args.lesion_code is None:
+            raise ValueError("You must supply either --target_label or --lesion_code.")
+        else:
+            # Map the lesion code (in lowercase) to its full label if available.
+            args.target_label = LABEL_MAP.get(
+                args.lesion_code.lower(), args.lesion_code
+            )
+            print(f"Derived target_label from lesion_code: {args.target_label}")
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load metadata and filter for rows whose full label matches the target label.
+    # Load metadata CSV and filter for rows with full label matching target_label.
     metadata = pd.read_csv(args.metadata_file)
-    # For each row, compute full label using LABEL_MAP.
+    # Create a new column 'full_label' from dx using LABEL_MAP.
     metadata["full_label"] = (
         metadata["dx"].str.lower().map(lambda x: LABEL_MAP.get(x, x))
     )
@@ -92,7 +114,7 @@ def main():
         print(f"No images found for target label {args.target_label}")
         return
 
-    # 1) Load pipeline.
+    # 1) Load the stable diffusion img2img pipeline.
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch.float16,
@@ -100,26 +122,27 @@ def main():
     )
     pipe = pipe.to(args.device)
 
-    # 2) Load fine-tuned LoRA model.
-    # (We assume the fine-tuned model from finetune_stable_diffusion.py was saved with .save_pretrained)
-    pipe.unet.load_state_dict(
-        torch.load(
-            os.path.join(args.output_dir, "pytorch_model.bin"), map_location="cpu"
-        ),
-        strict=False,
+    # 2) Load fine-tuned LoRA weights.
+    # First, try loading a full model state if available.
+    lora_model_path = os.path.join(args.output_dir, "pytorch_model.bin")
+    if os.path.exists(lora_model_path):
+        pipe.unet.load_state_dict(
+            torch.load(lora_model_path, map_location="cpu"), strict=False
+        )
+    # Then load the LoRA weight file (if available).
+    lora_weights_path = os.path.join(
+        args.output_dir, "pytorch_lora_weights.safetensors"
     )
-    # Alternatively, if using PEFT/LoRA weight file:
-    LoraLoaderMixin.load_lora_into_unet(
-        pipe.unet,
-        os.path.join(args.output_dir, "pytorch_lora_weights.safetensors"),
-        alpha=1.0,
-    )
+    if os.path.exists(lora_weights_path):
+        LoraLoaderMixin.load_lora_into_unet(pipe.unet, lora_weights_path, alpha=1.0)
+    else:
+        print("Warning: LoRA weight file not found. Continuing with base UNet.")
     pipe.unet.to(args.device, dtype=torch.float16)
 
-    # 3) Generate synthetic images.
-    # Use a prompt based on the target label.
+    # 3) Generate synthetic images using img2img.
+    # We set the prompt based on the target label.
     prompt = f"(skin lesion, {args.target_label})"
-    for img_path in tqdm(image_files, desc="Generating"):
+    for img_path in tqdm(image_files, desc="Generating synthetic images"):
         try:
             init_image = (
                 Image.open(img_path).convert("RGB").resize((512, 512), Image.BICUBIC)
