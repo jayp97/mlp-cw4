@@ -36,7 +36,7 @@ python generate_synthetic_images.py \
   --strength=0.8 \
   --num_images_per_prompt=10 \
   --device="cuda"
-  
+
 Alternatively, you can supply --lesion_code (e.g., "df") in place of --target_label.
 """
 
@@ -87,7 +87,6 @@ def parse_args():
         help="Directory containing all processed images",
     )
     parser.add_argument("--output_dir", type=str, required=True)
-    # New argument: --lora_weights
     parser.add_argument(
         "--lora_weights",
         type=str,
@@ -149,9 +148,8 @@ def main():
             pipe.unet.load_state_dict(
                 torch.load(lora_model_path, map_location="cpu"), strict=False
             )
-        # Load the LoRA weights using LoraLoaderMixin.
-        # Removed the alpha keyword because it is not expected.
-        LoraLoaderMixin.load_lora_into_unet(pipe.unet, args.lora_weights)
+        # Reverse the order of parameters: lora_weights then unet.
+        LoraLoaderMixin.load_lora_into_unet(args.lora_weights, pipe.unet)
     else:
         print(
             "Warning: --lora_weights not provided or file does not exist; continuing with base UNet."
