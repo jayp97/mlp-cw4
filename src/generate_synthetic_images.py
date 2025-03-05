@@ -4,38 +4,40 @@
 generate_synthetic_images.py
 
 Generates synthetic skin lesion images for a given target label using a fine-tuned
-Stable Diffusion model (with LoRA). At generation time, you specify the label or code
-(e.g., "Dermatofibroma" or "df"), and the script filters the metadata CSV to get images
-of that type, then uses them as init images in an img2img pipeline.
+Stable Diffusion model (with LoRA). At generation time, you specify either:
+  - --target_label="Dermatofibroma"
+  - or --lesion_code="df"  (which maps to "Dermatofibroma" via LABEL_MAP)
+
+The script filters the metadata CSV to find all images matching that label, then uses
+each image as an init_image in an img2img pipeline, producing synthetic output images.
 
 Arguments:
-  --pretrained_model_name_or_path : Path or identifier of the base Stable Diffusion model.
-  --metadata_file                 : Path to the metadata CSV file (HAM10000_metadata.csv, etc).
-  --target_label                  : Full target label for generation (e.g., "Dermatofibroma").
-  --lesion_code                   : Alternatively, a short lesion code (e.g., "df"). If provided and target_label is not,
-                                    it will be mapped to the full label via LABEL_MAP.
-  --train_data_dir                : Directory containing all processed images (512x512).
-  --output_dir                    : Where to save synthetic images.
-  --lora_weights                  : (Optional) Path to the LoRA weights file (e.g. "adapter_model.safetensors").
-  --guidance_scale                : Guidance scale for generation.
-  --num_inference_steps           : Number of denoising steps.
-  --strength                      : Strength of the img2img transformation.
-  --num_images_per_prompt         : Number of synthetic images to generate per input image.
-  --device                        : Device to use (default "cuda").
+  --pretrained_model_name_or_path : Base Stable Diffusion model (e.g. "runwayml/stable-diffusion-v1-5").
+  --metadata_file                 : Path to a CSV (e.g. HAM10000_metadata.csv).
+  --target_label                  : e.g. "Dermatofibroma".
+  --lesion_code                   : e.g. "df". If target_label is not given, we map code -> label.
+  --train_data_dir                : Folder with 512x512 images (no subfolders).
+  --output_dir                    : Where to save generated synthetic images.
+  --lora_weights                  : Path to LoRA weights file (if any), e.g. "adapter_model.safetensors".
+  --guidance_scale                : Guidance scale for generation (default=7.5).
+  --num_inference_steps           : Steps for diffusion (default=50).
+  --strength                      : Strength for img2img (default=0.8).
+  --num_images_per_prompt         : How many synthetic images per real image (default=5).
+  --device                        : "cuda" or "cpu" (default="cuda").
 
 Example Usage:
-python generate_synthetic_images.py \
-  --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
-  --metadata_file="data/raw/HAM10000_metadata.csv" \
-  --lesion_code="df" \
-  --train_data_dir="data/processed_sd/images" \
-  --output_dir="data/synthetic/images_dermatofibroma" \
-  --lora_weights="models/stable_diffusion_lora/adapter_model.safetensors" \
-  --guidance_scale=7.5 \
-  --num_inference_steps=50 \
-  --strength=0.8 \
-  --num_images_per_prompt=10 \
-  --device="cuda"
+  python generate_synthetic_images.py \
+    --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+    --metadata_file="data/raw/HAM10000_metadata.csv" \
+    --lesion_code="df" \
+    --train_data_dir="data/processed_sd/images" \
+    --output_dir="data/synthetic/images_dermatofibroma" \
+    --lora_weights="models/stable_diffusion_lora/adapter_model.safetensors" \
+    --guidance_scale=7.5 \
+    --num_inference_steps=50 \
+    --strength=0.8 \
+    --num_images_per_prompt=10 \
+    --device="cuda"
 """
 
 import argparse
@@ -43,11 +45,12 @@ import os
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
+
 from diffusers import StableDiffusionImg2ImgPipeline
 from diffusers.loaders import LoraLoaderMixin
 import pandas as pd
 
-# Mapping from short lesion codes to full labels:
+# Short lesion codes to full label:
 LABEL_MAP = {
     "akiec": "Actinic Keratosis",
     "bcc": "Basal Cell Carcinoma",
@@ -66,37 +69,37 @@ def parse_args():
         "--metadata_file",
         type=str,
         required=True,
-        help="Path to your metadata CSV file.",
+        help="CSV with at least columns [image_id, dx].",
     )
     parser.add_argument(
         "--target_label",
         type=str,
         default=None,
-        help="Full target label (e.g., 'Dermatofibroma').",
+        help="Full label for generation (e.g., 'Dermatofibroma').",
     )
     parser.add_argument(
         "--lesion_code",
         type=str,
         default=None,
-        help="Short code (e.g., 'df'). If supplied and target_label is missing, we map code -> label.",
+        help="Short code (e.g., 'df'). If target_label not provided, we map code->label.",
     )
     parser.add_argument(
         "--train_data_dir",
         type=str,
         required=True,
-        help="Directory with all processed images (512x512).",
+        help="Folder containing 512x512 images.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
         required=True,
-        help="Where to save the synthetic images.",
+        help="Folder to save the generated images.",
     )
     parser.add_argument(
         "--lora_weights",
         type=str,
         default=None,
-        help="Path to LoRA weights file (e.g. 'adapter_model.safetensors').",
+        help="Path to LoRA weights (e.g., 'adapter_model.safetensors').",
     )
     parser.add_argument("--guidance_scale", type=float, default=7.5)
     parser.add_argument("--num_inference_steps", type=int, default=50)
@@ -109,67 +112,59 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # If target_label is None, try to derive from lesion_code.
-    if args.target_label is None:
-        if args.lesion_code is None:
-            raise ValueError("Must supply either --target_label or --lesion_code.")
-        else:
-            # Map code -> label
-            derived_label = LABEL_MAP.get(args.lesion_code.lower(), args.lesion_code)
-            args.target_label = derived_label
-            print(f"Derived target_label from lesion_code: {args.target_label}")
+    # Derive target_label from lesion_code if needed
+    if not args.target_label:
+        if not args.lesion_code:
+            raise ValueError("You must provide either --target_label or --lesion_code.")
+        # Map short code to label
+        args.target_label = LABEL_MAP.get(args.lesion_code.lower(), args.lesion_code)
+        print(f"Derived target_label from lesion_code: {args.target_label}")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Read metadata CSV and filter rows matching the target label
-    metadata = pd.read_csv(args.metadata_file)
-    metadata["full_label"] = (
-        metadata["dx"].str.lower().map(lambda x: LABEL_MAP.get(x, x))
-    )
-    filtered = metadata[metadata["full_label"].str.lower() == args.target_label.lower()]
-    image_ids = filtered["image_id"].tolist()
+    # 1) Read the metadata and filter the images for the chosen label
+    df = pd.read_csv(args.metadata_file)
+    df["full_label"] = df["dx"].str.lower().map(lambda x: LABEL_MAP.get(x, x))
+    subset = df[df["full_label"].str.lower() == args.target_label.lower()]
+    image_ids = subset["image_id"].tolist()
+
+    # Build a list of existing image file paths
     image_files = [
         os.path.join(args.train_data_dir, f"{img_id}.jpg")
         for img_id in image_ids
         if os.path.exists(os.path.join(args.train_data_dir, f"{img_id}.jpg"))
     ]
     if not image_files:
-        print(f"No images found for target label: {args.target_label}")
+        print(f"No images found for target label '{args.target_label}'. Exiting.")
         return
 
-    # 1) Load the Stable Diffusion img2img pipeline
+    # 2) Load the pipeline from the base model
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         torch_dtype=torch.float16,
-        safety_checker=None,  # user chooses to disable it
-    )
-    pipe = pipe.to(args.device)
+        safety_checker=None,  # user-chosen
+    ).to(args.device)
 
-    # 2) Load fine-tuned LoRA weights if provided
-    if args.lora_weights is not None and os.path.exists(args.lora_weights):
-        # Attempt to load a saved base model state first (if present)
-        lora_model_path = os.path.join(args.output_dir, "pytorch_model.bin")
-        if os.path.exists(lora_model_path):
-            pipe.unet.load_state_dict(
-                torch.load(lora_model_path, map_location="cpu"), strict=False
+    # 3) If LoRA weights are provided, load them using named arguments
+    # The function signature typically is:
+    #   load_lora_into_unet(unet, lora_state_dict_or_path, ...)
+    # So we do:
+    if args.lora_weights and os.path.exists(args.lora_weights):
+        try:
+            LoraLoaderMixin.load_lora_into_unet(
+                unet=pipe.unet, state_dict_or_path=args.lora_weights
             )
-
-        # Important: The method signature is: load_lora_into_unet(unet, weights_path, ...)
-        # But your local version might be reversed or differ. We'll match your error message
-        # which says the first param is unet, second param is the weights path:
-        LoraLoaderMixin.load_lora_into_unet(pipe.unet, args.lora_weights)
+            print(f"Loaded LoRA from {args.lora_weights}")
+        except Exception as e:
+            print(f"Error loading LoRA weights: {e}")
     else:
-        print(
-            "Warning: either --lora_weights not provided, or the file doesn't exist. Using base UNet..."
-        )
+        print("Warning: no valid --lora_weights provided. Using base UNet only.")
 
-    pipe.unet.to(args.device, dtype=torch.float16)
-
-    # 3) Generate images using img2img
+    # 4) Synthesize images with img2img
     prompt = f"(skin lesion, {args.target_label})"
     for img_path in tqdm(image_files, desc="Generating synthetic images"):
         try:
-            init_image = (
+            init_img = (
                 Image.open(img_path).convert("RGB").resize((512, 512), Image.BICUBIC)
             )
         except Exception as e:
@@ -180,7 +175,7 @@ def main():
         for i in range(args.num_images_per_prompt):
             result = pipe(
                 prompt=prompt,
-                image=init_image,
+                image=init_img,
                 strength=args.strength,
                 guidance_scale=args.guidance_scale,
                 num_inference_steps=args.num_inference_steps,
@@ -189,7 +184,7 @@ def main():
             out_fname = f"{base_name}_synthetic_{i}.png"
             gen_image.save(os.path.join(args.output_dir, out_fname))
 
-    print(f"Generation complete. Synthetic images saved to {args.output_dir}")
+    print(f"Done. Synthetic images saved in '{args.output_dir}'.")
 
 
 if __name__ == "__main__":
