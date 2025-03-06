@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import os
 import argparse
 import numpy as np
@@ -64,6 +65,41 @@ def get_image_paths(directory, extensions=(".jpg", ".jpeg", ".png")):
     return image_paths
 
 
+def filter_images_by_class(image_paths, metadata_path, class_name):
+    """Filter image paths to only include images of the specified class."""
+    try:
+        # Read metadata
+        metadata = pd.read_csv(metadata_path)
+
+        # Filter metadata to only include the specified class
+        class_metadata = metadata[metadata["dx"] == class_name]
+
+        if len(class_metadata) == 0:
+            logger.warning(
+                f"No images found for class '{class_name}' in metadata. Available classes: {metadata['dx'].unique()}"
+            )
+            return []
+
+        # Get image IDs for the specified class
+        class_image_ids = set(class_metadata["image_id"].tolist())
+
+        # Filter image paths
+        filtered_paths = []
+        for path in image_paths:
+            # Extract image ID from filename (remove extension)
+            image_id = os.path.splitext(os.path.basename(path))[0]
+
+            # Check if this image is in our filtered list
+            if image_id in class_image_ids:
+                filtered_paths.append(path)
+
+        return filtered_paths
+
+    except Exception as e:
+        logger.error(f"Error filtering images by class: {e}")
+        return []
+
+
 def calculate_image_statistics(image):
     """Calculate basic image statistics."""
     # Convert to numpy if it's a torch tensor
@@ -100,7 +136,9 @@ def calculate_image_statistics(image):
     hist_g, _ = np.histogram(image[:, :, 1], bins=256, range=(0, 1))
     hist_b, _ = np.histogram(image[:, :, 2], bins=256, range=(0, 1))
 
-    entropy_r = scipy_stats.entropy(hist_r + 1e-10)
+    entropy_r = scipy_stats.entropy(
+        hist_r + 1e-10
+    )  # Add small constant to avoid log(0)
     entropy_g = scipy_stats.entropy(hist_g + 1e-10)
     entropy_b = scipy_stats.entropy(hist_b + 1e-10)
 
@@ -209,7 +247,14 @@ def compute_similarity_metrics(real_images, synthetic_images):
     return similarity_metrics
 
 
-def train_classifier(real_dir, synthetic_dir, num_epochs=10, batch_size=16):
+def train_classifier(
+    real_dir,
+    synthetic_dir,
+    num_epochs=10,
+    batch_size=16,
+    metadata_path=None,
+    class_name=None,
+):
     """Train a classifier to distinguish between real and synthetic images."""
     # Prepare data
     transform = transforms.Compose(
@@ -222,6 +267,13 @@ def train_classifier(real_dir, synthetic_dir, num_epochs=10, batch_size=16):
 
     real_paths = get_image_paths(real_dir)
     synthetic_paths = get_image_paths(synthetic_dir)
+
+    # Filter real images by class if class_name and metadata_path are provided
+    if class_name and metadata_path and os.path.exists(metadata_path):
+        real_paths = filter_images_by_class(real_paths, metadata_path, class_name)
+        logger.info(
+            f"Filtered real images for class '{class_name}': {len(real_paths)} images"
+        )
 
     # Balance datasets
     min_size = min(len(real_paths), len(synthetic_paths))
@@ -351,8 +403,10 @@ def analyze_images(
     synthetic_dir,
     output_dir,
     class_name=None,
+    metadata_path=None,
     run_classifier=True,
     num_epochs=5,
+    max_real_images=500,
 ):
     """Analyze real and synthetic images and compare them."""
     os.makedirs(output_dir, exist_ok=True)
@@ -360,6 +414,23 @@ def analyze_images(
     # Get image paths
     real_paths = get_image_paths(real_dir)
     synthetic_paths = get_image_paths(synthetic_dir)
+
+    # Filter real images by class if metadata is provided
+    if class_name and metadata_path and os.path.exists(metadata_path):
+        logger.info(f"Filtering real images for class: {class_name}")
+        real_paths_filtered = filter_images_by_class(
+            real_paths, metadata_path, class_name
+        )
+
+        if len(real_paths_filtered) == 0:
+            logger.warning(
+                f"No images found for class '{class_name}'. Using all real images."
+            )
+        else:
+            logger.info(
+                f"Found {len(real_paths_filtered)} real images for class '{class_name}'"
+            )
+            real_paths = real_paths_filtered
 
     if len(real_paths) == 0:
         logger.error(f"No images found in real directory: {real_dir}")
@@ -369,8 +440,17 @@ def analyze_images(
         logger.error(f"No images found in synthetic directory: {synthetic_dir}")
         return False
 
+    # Limit the number of real images for analysis if there are too many
+    if len(real_paths) > max_real_images:
+        logger.info(
+            f"Limiting analysis to {max_real_images} real images (out of {len(real_paths)})"
+        )
+        real_paths_sample = random.sample(real_paths, max_real_images)
+    else:
+        real_paths_sample = real_paths
+
     logger.info(
-        f"Found {len(real_paths)} real images and {len(synthetic_paths)} synthetic images"
+        f"Analyzing {len(real_paths_sample)} real images and {len(synthetic_paths)} synthetic images"
     )
 
     # Create transform
@@ -383,9 +463,7 @@ def analyze_images(
     real_stats = []
 
     # Process real images directly without DataLoader
-    for img_path in tqdm(
-        real_paths[:500], desc="Real images"
-    ):  # Limit to 500 images for speed
+    for img_path in tqdm(real_paths_sample, desc="Real images"):
         try:
             # Open and process image
             image = Image.open(img_path).convert("RGB")
@@ -539,9 +617,12 @@ def analyze_images(
 
     # Compute similarity metrics
     logger.info("Computing similarity metrics...")
+    max_similarity_comparisons = min(
+        len(real_paths_sample), 100
+    )  # Limit comparisons for speed
     similarity_metrics = compute_similarity_metrics(
-        real_paths[:100], synthetic_paths
-    )  # Limit real images for comparison
+        random.sample(real_paths_sample, max_similarity_comparisons), synthetic_paths
+    )
 
     # Save similarity metrics to CSV
     similarity_df = pd.DataFrame(similarity_metrics)
@@ -563,17 +644,24 @@ def analyze_images(
     # Calculate and display summary statistics
     summary = {
         "real_images": len(real_paths),
+        "filtered_real_images": len(real_paths_sample),
         "synthetic_images": len(synthetic_paths),
-        "mean_ssim": similarity_df["ssim"].mean(),
-        "mean_psnr": similarity_df["psnr"].mean(),
-        "mean_hist_similarity": similarity_df["hist_similarity"].mean(),
+        "mean_ssim": similarity_df["ssim"].mean() if len(similarity_df) > 0 else 0,
+        "mean_psnr": similarity_df["psnr"].mean() if len(similarity_df) > 0 else 0,
+        "mean_hist_similarity": (
+            similarity_df["hist_similarity"].mean() if len(similarity_df) > 0 else 0
+        ),
     }
 
     # Train classifier if requested
     if run_classifier:
         logger.info("Training classifier to distinguish real from synthetic images...")
         classification_results, model = train_classifier(
-            real_dir, synthetic_dir, num_epochs=num_epochs
+            real_dir=real_dir,
+            synthetic_dir=synthetic_dir,
+            num_epochs=num_epochs,
+            metadata_path=metadata_path,
+            class_name=class_name,
         )
 
         # Add classification results to summary
@@ -644,7 +732,11 @@ def analyze_images(
             f.write(f"Class: {class_name}\n\n")
 
         f.write("Dataset Information:\n")
-        f.write(f"  Real images: {summary['real_images']}\n")
+        f.write(f"  Total real images: {summary['real_images']}\n")
+        if summary["real_images"] != summary["filtered_real_images"]:
+            f.write(
+                f"  Filtered real images analyzed: {summary['filtered_real_images']}\n"
+            )
         f.write(f"  Synthetic images: {summary['synthetic_images']}\n\n")
 
         f.write("Similarity Metrics:\n")
@@ -731,7 +823,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir", default="evaluation_results", help="Directory to save results"
     )
-    parser.add_argument("--class_name", help="Class name (for reporting)")
+    parser.add_argument("--class_name", help="Class name (for reporting and filtering)")
+    parser.add_argument(
+        "--metadata_path",
+        default="data/raw/HAM10000_metadata.csv",
+        help="Path to metadata CSV file",
+    )
     parser.add_argument(
         "--skip_classifier",
         action="store_true",
@@ -754,6 +851,8 @@ if __name__ == "__main__":
         synthetic_dir=args.synthetic_dir,
         output_dir=args.output_dir,
         class_name=args.class_name,
+        metadata_path=args.metadata_path,
         run_classifier=not args.skip_classifier,
         num_epochs=args.epochs,
+        max_real_images=args.max_real,
     )
