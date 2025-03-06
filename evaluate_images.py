@@ -50,6 +50,7 @@ class ImageDataset(Dataset):
         if self.label is not None:
             return image, self.label, img_path
 
+        # Return a string path, not a tuple
         return image, img_path
 
 
@@ -165,6 +166,10 @@ def compute_similarity_metrics(real_images, synthetic_images):
     ):
         real_img = cv2.imread(real_path)
         synth_img = cv2.imread(synth_path)
+
+        # Skip if reading fails
+        if real_img is None or synth_img is None:
+            continue
 
         # Resize if images have different dimensions
         if real_img.shape != synth_img.shape:
@@ -373,38 +378,48 @@ def analyze_images(
         [transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor()]
     )
 
-    # Create datasets
-    real_dataset = ImageDataset(real_paths, transform=transform)
-    synthetic_dataset = ImageDataset(synthetic_paths, transform=transform)
-
-    # Create data loaders
-    real_loader = DataLoader(real_dataset, batch_size=1, shuffle=False)
-    synthetic_loader = DataLoader(synthetic_dataset, batch_size=1, shuffle=False)
-
-    # Calculate image statistics
+    # Calculate image statistics directly from files
     logger.info("Calculating image statistics for real images...")
     real_stats = []
-    for batch in tqdm(real_loader, desc="Real images"):
-        # Correctly unpack the batch
-        img = batch[0].squeeze(0)  # First element is the image tensor
-        img_path = batch[1]  # Second element is the img_path
 
-        stats = calculate_image_statistics(img)
-        stats["image"] = os.path.basename(img_path)
-        stats["type"] = "real"
-        real_stats.append(stats)
+    # Process real images directly without DataLoader
+    for img_path in tqdm(
+        real_paths[:500], desc="Real images"
+    ):  # Limit to 500 images for speed
+        try:
+            # Open and process image
+            image = Image.open(img_path).convert("RGB")
+            # Apply transforms
+            if transform:
+                image = transform(image)
+            # Calculate statistics
+            stats = calculate_image_statistics(image)
+            stats["image"] = os.path.basename(img_path)
+            stats["type"] = "real"
+            real_stats.append(stats)
+        except Exception as e:
+            logger.warning(f"Error processing {img_path}: {e}")
+            continue
 
     logger.info("Calculating image statistics for synthetic images...")
     synthetic_stats = []
-    for batch in tqdm(synthetic_loader, desc="Synthetic images"):
-        # Correctly unpack the batch
-        img = batch[0].squeeze(0)  # First element is the image tensor
-        img_path = batch[1]  # Second element is the img_path
 
-        stats = calculate_image_statistics(img)
-        stats["image"] = os.path.basename(img_path)
-        stats["type"] = "synthetic"
-        synthetic_stats.append(stats)
+    # Process synthetic images directly
+    for img_path in tqdm(synthetic_paths, desc="Synthetic images"):
+        try:
+            # Open and process image
+            image = Image.open(img_path).convert("RGB")
+            # Apply transforms
+            if transform:
+                image = transform(image)
+            # Calculate statistics
+            stats = calculate_image_statistics(image)
+            stats["image"] = os.path.basename(img_path)
+            stats["type"] = "synthetic"
+            synthetic_stats.append(stats)
+        except Exception as e:
+            logger.warning(f"Error processing {img_path}: {e}")
+            continue
 
     # Combine statistics
     all_stats = pd.DataFrame(real_stats + synthetic_stats)
@@ -524,7 +539,9 @@ def analyze_images(
 
     # Compute similarity metrics
     logger.info("Computing similarity metrics...")
-    similarity_metrics = compute_similarity_metrics(real_paths, synthetic_paths)
+    similarity_metrics = compute_similarity_metrics(
+        real_paths[:100], synthetic_paths
+    )  # Limit real images for comparison
 
     # Save similarity metrics to CSV
     similarity_df = pd.DataFrame(similarity_metrics)
@@ -722,6 +739,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--epochs", type=int, default=5, help="Number of epochs for classifier training"
+    )
+    parser.add_argument(
+        "--max_real",
+        type=int,
+        default=500,
+        help="Maximum number of real images to analyze",
     )
 
     args = parser.parse_args()
