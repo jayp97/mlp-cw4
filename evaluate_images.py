@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import os
 import argparse
 import numpy as np
@@ -385,8 +384,11 @@ def analyze_images(
     # Calculate image statistics
     logger.info("Calculating image statistics for real images...")
     real_stats = []
-    for img, img_path in tqdm(real_loader, desc="Real images"):
-        img = img.squeeze(0)  # Remove batch dimension
+    for batch in tqdm(real_loader, desc="Real images"):
+        # Correctly unpack the batch
+        img = batch[0].squeeze(0)  # First element is the image tensor
+        img_path = batch[1]  # Second element is the img_path
+
         stats = calculate_image_statistics(img)
         stats["image"] = os.path.basename(img_path)
         stats["type"] = "real"
@@ -394,8 +396,11 @@ def analyze_images(
 
     logger.info("Calculating image statistics for synthetic images...")
     synthetic_stats = []
-    for img, img_path in tqdm(synthetic_loader, desc="Synthetic images"):
-        img = img.squeeze(0)  # Remove batch dimension
+    for batch in tqdm(synthetic_loader, desc="Synthetic images"):
+        # Correctly unpack the batch
+        img = batch[0].squeeze(0)  # First element is the image tensor
+        img_path = batch[1]  # Second element is the img_path
+
         stats = calculate_image_statistics(img)
         stats["image"] = os.path.basename(img_path)
         stats["type"] = "synthetic"
