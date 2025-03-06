@@ -13,7 +13,7 @@ from sklearn.metrics import confusion_matrix, classification_report
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 import seaborn as sns
-from scipy import stats
+import scipy.stats as scipy_stats
 import cv2
 from tqdm import tqdm
 import random
@@ -100,9 +100,9 @@ def calculate_image_statistics(image):
     hist_g, _ = np.histogram(image[:, :, 1], bins=256, range=(0, 1))
     hist_b, _ = np.histogram(image[:, :, 2], bins=256, range=(0, 1))
 
-    entropy_r = stats.entropy(hist_r + 1e-10)  # Add small constant to avoid log(0)
-    entropy_g = stats.entropy(hist_g + 1e-10)
-    entropy_b = stats.entropy(hist_b + 1e-10)
+    entropy_r = scipy_stats.entropy(hist_r + 1e-10)
+    entropy_g = scipy_stats.entropy(hist_g + 1e-10)
+    entropy_b = scipy_stats.entropy(hist_b + 1e-10)
 
     # Convert to Lab color space for perceptual metrics
     rgb_image = (image * 255).astype(np.uint8)
@@ -516,7 +516,7 @@ def analyze_images(
 
             if len(real_values) > 0 and len(synth_values) > 0:
                 # Perform t-test
-                t_stat, p_val = stats.ttest_ind(
+                t_stat, p_val = scipy_stats.ttest_ind(
                     real_values, synth_values, equal_var=False
                 )
                 test_results[metric] = {
