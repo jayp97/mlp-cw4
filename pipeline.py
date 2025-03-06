@@ -159,6 +159,8 @@ def run_pipeline(
     data_prep_cmd = [
         sys.executable,
         "data_preparation.py",
+        "--output_dir",
+        class_specific_dir,  # Added this line to specify output directory
     ]
 
     if specific_class:

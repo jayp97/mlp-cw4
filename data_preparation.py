@@ -186,6 +186,7 @@ def create_class_specific_data(
         return None
 
     # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
     class_dir = os.path.join(output_dir, specific_class)
     os.makedirs(class_dir, exist_ok=True)
 
@@ -253,16 +254,30 @@ if __name__ == "__main__":
         default=None,
         help="Path to test split CSV",
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory for data",
+    )
     args = parser.parse_args()
+
+    # Set default output directory
+    output_dir = args.output_dir or "data/fine_tuning_class_specific"
 
     if args.specific_class:
         create_class_specific_data(
-            args.specific_class, train_split_path=args.train_split
+            args.specific_class,
+            train_split_path=args.train_split,
+            output_dir=output_dir,
         )
     else:
         # Get available lesion types
+        output_dir_general = args.output_dir or "data/fine_tuning"
         lesion_types = prepare_data_for_fine_tuning(
-            train_split_path=args.train_split, test_split_path=args.test_split
+            train_split_path=args.train_split,
+            test_split_path=args.test_split,
+            output_dir=output_dir_general,
         )
 
         # Example: Create dataset for a specific class
@@ -270,5 +285,5 @@ if __name__ == "__main__":
             # You can change this to any class you want to focus on
             specific_class = lesion_types[0]  # e.g., 'dermatofibroma'
             create_class_specific_data(
-                specific_class, train_split_path=args.train_split
+                specific_class, train_split_path=args.train_split, output_dir=output_dir
             )
