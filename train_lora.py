@@ -18,6 +18,8 @@ from torchvision import transforms
 import random
 import logging
 import math
+import csv
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -135,6 +137,16 @@ def train_lora(
     torch.manual_seed(seed)
     random.seed(seed)
 
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Setup loss tracking
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    loss_log_file = os.path.join(output_dir, f"loss_log_{timestamp}.csv")
+    with open(loss_log_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "step", "loss", "timestamp"])
+
     # Initialize Accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -150,13 +162,13 @@ def train_lora(
     # Load UNet
     unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
 
-    # Load VAE - THIS IS ESSENTIAL FOR PROPER LATENT ENCODING
+    # Load VAE
     vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
 
     # Freeze parameters
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    vae.requires_grad_(False)  # Make sure VAE is frozen
+    vae.requires_grad_(False)
 
     # Configure LoRA for UNet
     unet_lora_config = LoraConfig(
@@ -220,7 +232,7 @@ def train_lora(
     # Prepare everything for accelerator
     unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
 
-    # Move text_encoder and vae to device for encoding (but not through accelerator since we don't train them)
+    # Move text_encoder and vae to device for encoding (but not through accelerator)
     device = accelerator.device
     text_encoder.to(device)
     vae.to(device)
@@ -231,8 +243,11 @@ def train_lora(
     )
     max_train_steps = num_epochs * num_update_steps_per_epoch
 
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Create training stats tracking
+    epoch_losses = []
+    min_loss = float("inf")
+    min_loss_epoch = 0
+    min_loss_step = 0
 
     # Training loop
     global_step = 0
@@ -245,6 +260,8 @@ def train_lora(
             total=len(dataloader), disable=not accelerator.is_local_main_process
         )
         progress_bar.set_description(f"Epoch {epoch+1}/{num_epochs}")
+
+        epoch_loss = 0.0
 
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(unet):
@@ -259,7 +276,7 @@ def train_lora(
                     with torch.no_grad():
                         encoder_hidden_states = text_encoder(input_ids)[0]
 
-                # Encode images to latent space using VAE
+                # Encode images to latent space
                 with torch.no_grad():
                     latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
 
@@ -275,7 +292,7 @@ def train_lora(
                     device=latents.device,
                 ).long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
+                # Add noise to the latents
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the model prediction
@@ -296,8 +313,56 @@ def train_lora(
             progress_bar.update(1)
             global_step += 1
 
+            # Track loss
+            loss_value = loss.detach().item()
+            epoch_loss += loss_value
+
+            # Log loss to CSV
+            with open(loss_log_file, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        epoch + 1,
+                        global_step,
+                        loss_value,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ]
+                )
+
+            # Save best model
+            if loss_value < min_loss:
+                min_loss = loss_value
+                min_loss_epoch = epoch + 1
+                min_loss_step = global_step
+
+                # Save best model
+                best_dir = os.path.join(output_dir, "best")
+                os.makedirs(best_dir, exist_ok=True)
+
+                # Save UNet LoRA weights
+                unwrapped_unet = accelerator.unwrap_model(unet)
+                unwrapped_unet.save_pretrained(os.path.join(best_dir, "unet_lora"))
+
+                # Save Text Encoder LoRA weights if trained
+                if train_text_encoder:
+                    unwrapped_text_encoder = text_encoder
+                    unwrapped_text_encoder.save_pretrained(
+                        os.path.join(best_dir, "text_encoder_lora")
+                    )
+
+                # Save model info
+                with open(os.path.join(best_dir, "model_info.txt"), "w") as f:
+                    f.write(f"Class: {class_name}\n")
+                    f.write(f"Base model: {model_id}\n")
+                    f.write(f"Best loss: {min_loss}\n")
+                    f.write(f"Epoch: {min_loss_epoch}\n")
+                    f.write(f"Step: {min_loss_step}\n")
+                    f.write(
+                        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    )
+
             # Log info
-            logs = {"loss": loss.detach().item(), "step": global_step}
+            logs = {"loss": loss_value, "step": global_step}
             progress_bar.set_postfix(**logs)
 
             # Save checkpoint
@@ -319,6 +384,13 @@ def train_lora(
 
                 logger.info(f"Saved checkpoint at step {global_step}")
 
+        # Calculate average epoch loss
+        avg_epoch_loss = epoch_loss / len(dataloader)
+        epoch_losses.append(avg_epoch_loss)
+        logger.info(
+            f"Epoch {epoch+1}/{num_epochs} - Average loss: {avg_epoch_loss:.6f}"
+        )
+
         # Save after each epoch
         epoch_dir = os.path.join(output_dir, f"epoch-{epoch+1}")
         os.makedirs(epoch_dir, exist_ok=True)
@@ -333,6 +405,13 @@ def train_lora(
             unwrapped_text_encoder.save_pretrained(
                 os.path.join(epoch_dir, "text_encoder_lora")
             )
+
+        # Save epoch summary
+        with open(os.path.join(epoch_dir, "epoch_info.txt"), "w") as f:
+            f.write(f"Epoch: {epoch+1}\n")
+            f.write(f"Average loss: {avg_epoch_loss:.6f}\n")
+            f.write(f"Steps: {global_step}\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         logger.info(f"Saved model at epoch {epoch+1}")
 
@@ -351,14 +430,39 @@ def train_lora(
             os.path.join(final_dir, "text_encoder_lora")
         )
 
-    # Save model info - class name and other details
+    # Save overall training summary
+    with open(os.path.join(output_dir, "training_summary.txt"), "w") as f:
+        f.write(f"Class: {class_name}\n")
+        f.write(f"Base model: {model_id}\n")
+        f.write(f"Training steps: {global_step}\n")
+        f.write(f"Training epochs: {num_epochs}\n")
+        f.write(
+            f"Best loss: {min_loss:.6f} (Epoch {min_loss_epoch}, Step {min_loss_step})\n"
+        )
+        f.write(f"Final loss: {epoch_losses[-1]:.6f}\n")
+        f.write(f"Loss file: {os.path.basename(loss_log_file)}\n")
+
+        # Add epoch loss summary
+        f.write("\nEpoch loss summary:\n")
+        for i, loss in enumerate(epoch_losses):
+            f.write(f"Epoch {i+1}: {loss:.6f}\n")
+
+    # Save model info in final dir
     with open(os.path.join(final_dir, "model_info.txt"), "w") as f:
         f.write(f"Class: {class_name}\n")
         f.write(f"Base model: {model_id}\n")
         f.write(f"Training steps: {global_step}\n")
         f.write(f"Training epochs: {num_epochs}\n")
+        f.write(
+            f"Best loss: {min_loss:.6f} (Epoch {min_loss_epoch}, Step {min_loss_step})\n"
+        )
 
     logger.info("Training complete!")
+    logger.info(
+        f"Best loss: {min_loss:.6f} (Epoch {min_loss_epoch}, Step {min_loss_step})"
+    )
+    logger.info(f"Loss log saved to: {loss_log_file}")
+
     return os.path.join(final_dir)
 
 
