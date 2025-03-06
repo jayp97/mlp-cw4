@@ -20,6 +20,8 @@ mlp-cw4/
 ├── train_lora.py                      # Script to fine-tune the model using LoRA
 ├── generate_images.py                 # Script to generate synthetic images
 ├── pipeline.py                        # Script for full end-to-end pipeline
+├── evaluate_images.py                 # Script for image evaluation
+├── visualise_loss.py                  # Script for visualising training loss
 ├── requirements.txt                   # Required packages
 └── README.md                          # Instructions
 ```

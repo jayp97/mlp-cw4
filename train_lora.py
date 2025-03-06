@@ -8,7 +8,7 @@ from diffusers import (
     UNet2DConditionModel,
     AutoencoderKL,
 )
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, get_scheduler
 from peft import LoraConfig, get_peft_model
 from tqdm import tqdm
 import pandas as pd
@@ -100,15 +100,19 @@ def train_lora(
     num_epochs=100,
     gradient_accumulation_steps=4,
     save_steps=500,
-    mixed_precision="fp16",
+    mixed_precision="bf16",  # Changed from fp16 to bf16 for better stability
     seed=42,
-    lora_r=8,
+    lora_r=16,  # Increased from 8 to 16 for more capacity
     lora_alpha=32,
-    lora_dropout=0.1,
+    lora_dropout=0.05,  # Reduced from 0.1 to 0.05 for better generalization
     lora_text_encoder_r=8,
     lora_text_encoder_alpha=32,
     lora_text_encoder_dropout=0.1,
     train_text_encoder=True,
+    use_8bit_adam=False,  # New parameter
+    clip_grad_norm=1.0,  # New parameter
+    warmup_steps=500,  # New parameter
+    train_split_path=None,  # New parameter for using the train split
 ):
     """
     Fine-tune Stable Diffusion using LoRA for generating skin lesion images.
@@ -132,6 +136,10 @@ def train_lora(
         lora_text_encoder_alpha: LoRA alpha for text encoder
         lora_text_encoder_dropout: LoRA dropout for text encoder
         train_text_encoder: Whether to train the text encoder
+        use_8bit_adam: Whether to use 8-bit Adam optimizer
+        clip_grad_norm: Maximum gradient norm for clipping
+        warmup_steps: Number of warmup steps for learning rate scheduler
+        train_split_path: Path to train split CSV
     """
     # Set random seed
     torch.manual_seed(seed)
@@ -170,12 +178,21 @@ def train_lora(
     text_encoder.requires_grad_(False)
     vae.requires_grad_(False)
 
-    # Configure LoRA for UNet
+    # Configure LoRA for UNet - target more modules for better detail learning
     unet_lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        target_modules=[
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "proj_in",
+            "proj_out",
+            "ff.net.0.proj",
+            "ff.net.2",
+        ],  # Extended target modules
     )
     unet = get_peft_model(unet, unet_lora_config)
     unet.train()
@@ -186,7 +203,7 @@ def train_lora(
             r=lora_text_encoder_r,
             lora_alpha=lora_text_encoder_alpha,
             lora_dropout=lora_text_encoder_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # Added out_proj
         )
         text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
         text_encoder.train()
@@ -194,23 +211,75 @@ def train_lora(
     # Load the scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-    # Prepare dataset
-    if class_name:
-        image_dir = os.path.join(train_data_dir, class_name)
-        prompt_file = os.path.join(train_data_dir, f"{class_name}_prompts.txt")
-    else:
-        # Find a valid class directory by looking for prompt files
-        prompt_files = [
-            f for f in os.listdir(train_data_dir) if f.endswith("_prompts.txt")
-        ]
-        if not prompt_files:
-            raise ValueError(
-                f"No prompt files found in {train_data_dir}. Please run data_preparation.py first."
-            )
+    # Prepare dataset - modified to use train split if provided
+    if train_split_path and os.path.exists(train_split_path):
+        # Use only training images for fine-tuning
+        logger.info(f"Using train split from: {train_split_path}")
+        train_df = pd.read_csv(train_split_path)
 
-        class_name = prompt_files[0].replace("_prompts.txt", "")
-        image_dir = os.path.join(train_data_dir, class_name)
-        prompt_file = os.path.join(train_data_dir, prompt_files[0])
+        if class_name:
+            # Filter to only include the specified class
+            train_df = train_df[train_df["dx"] == class_name]
+
+        # Get list of image IDs to use
+        train_image_ids = set(train_df["image_id"].tolist())
+
+        # Filter prompt file to only include training images
+        if class_name:
+            image_dir = os.path.join(train_data_dir, class_name)
+            prompt_file = os.path.join(train_data_dir, f"{class_name}_prompts.txt")
+        else:
+            # Find a valid class directory by looking for prompt files
+            prompt_files = [
+                f for f in os.listdir(train_data_dir) if f.endswith("_prompts.txt")
+            ]
+            if not prompt_files:
+                raise ValueError(
+                    f"No prompt files found in {train_data_dir}. Please run data_preparation.py first."
+                )
+
+            class_name = prompt_files[0].replace("_prompts.txt", "")
+            image_dir = os.path.join(train_data_dir, class_name)
+            prompt_file = os.path.join(train_data_dir, prompt_files[0])
+
+        # Create a filtered prompt file with only training images
+        filtered_prompt_file = os.path.join(
+            train_data_dir, f"{class_name}_train_prompts.txt"
+        )
+
+        with open(prompt_file, "r") as src, open(filtered_prompt_file, "w") as dst:
+            for line in src:
+                parts = line.strip().split(",", 1)
+                if len(parts) != 2:
+                    continue
+
+                image_file, prompt = parts
+                image_id = os.path.splitext(image_file)[0]
+
+                # Include only if in training set
+                if image_id in train_image_ids:
+                    dst.write(f"{image_file},{prompt}\n")
+
+        # Use the filtered prompt file
+        prompt_file = filtered_prompt_file
+    else:
+        # Use the original logic for dataset preparation
+        if class_name:
+            image_dir = os.path.join(train_data_dir, class_name)
+            prompt_file = os.path.join(train_data_dir, f"{class_name}_prompts.txt")
+        else:
+            # Find a valid class directory by looking for prompt files
+            prompt_files = [
+                f for f in os.listdir(train_data_dir) if f.endswith("_prompts.txt")
+            ]
+            if not prompt_files:
+                raise ValueError(
+                    f"No prompt files found in {train_data_dir}. Please run data_preparation.py first."
+                )
+
+            class_name = prompt_files[0].replace("_prompts.txt", "")
+            image_dir = os.path.join(train_data_dir, class_name)
+            prompt_file = os.path.join(train_data_dir, prompt_files[0])
 
     logger.info(f"Training on class: {class_name}")
     logger.info(f"Image directory: {image_dir}")
@@ -222,26 +291,47 @@ def train_lora(
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
-    # Configure optimizer
+    # Configure optimizer with warmup
     params_to_optimize = list(unet.parameters())
     if train_text_encoder:
         params_to_optimize.extend(list(text_encoder.parameters()))
 
-    optimizer = torch.optim.AdamW(params_to_optimize, lr=learning_rate)
+    # Use 8-bit Adam if requested (helps with memory usage)
+    if use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
 
-    # Prepare everything for accelerator
-    unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
-
-    # Move text_encoder and vae to device for encoding (but not through accelerator)
-    device = accelerator.device
-    text_encoder.to(device)
-    vae.to(device)
+            optimizer = bnb.optim.AdamW8bit(params_to_optimize, lr=learning_rate)
+            logger.info("Using 8-bit Adam optimizer")
+        except ImportError:
+            logger.warning("bitsandbytes not installed, falling back to regular AdamW")
+            optimizer = torch.optim.AdamW(params_to_optimize, lr=learning_rate)
+    else:
+        optimizer = torch.optim.AdamW(params_to_optimize, lr=learning_rate)
 
     # Get total training steps
     num_update_steps_per_epoch = math.ceil(
         len(dataloader) / gradient_accumulation_steps
     )
     max_train_steps = num_epochs * num_update_steps_per_epoch
+
+    # Learning rate scheduler with warmup
+    lr_scheduler = get_scheduler(
+        "cosine",
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps,
+    )
+
+    # Prepare everything for accelerator
+    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, dataloader, lr_scheduler
+    )
+
+    # Move text_encoder and vae to device for encoding (but not through accelerator)
+    device = accelerator.device
+    text_encoder.to(device)
+    vae.to(device)
 
     # Create training stats tracking
     epoch_losses = []
@@ -305,8 +395,17 @@ def train_lora(
 
                 accelerator.backward(loss)
 
+                # Add gradient clipping
+                if clip_grad_norm > 0:
+                    accelerator.clip_grad_norm_(unet.parameters(), clip_grad_norm)
+                    if train_text_encoder:
+                        accelerator.clip_grad_norm_(
+                            text_encoder.parameters(), clip_grad_norm
+                        )
+
                 # Update parameters
                 optimizer.step()
+                lr_scheduler.step()  # Update learning rate
                 optimizer.zero_grad()
 
             # Update progress bar
@@ -362,7 +461,11 @@ def train_lora(
                     )
 
             # Log info
-            logs = {"loss": loss_value, "step": global_step}
+            logs = {
+                "loss": loss_value,
+                "step": global_step,
+                "lr": lr_scheduler.get_last_lr()[0],
+            }
             progress_bar.set_postfix(**logs)
 
             # Save checkpoint
@@ -507,10 +610,40 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="fp16",
+        default="bf16",
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode",
     )
+    parser.add_argument(
+        "--use_8bit_adam",
+        action="store_true",
+        help="Use 8-bit Adam optimizer",
+    )
+    parser.add_argument(
+        "--train_split",
+        type=str,
+        default=None,
+        help="Path to train split CSV",
+    )
+    parser.add_argument(
+        "--lora_r",
+        type=int,
+        default=16,
+        help="LoRA rank",
+    )
 
     args = parser.parse_args()
-    train_lora(**vars(args))
+    train_lora(
+        model_id=args.model_id,
+        train_data_dir=args.train_data_dir,
+        class_name=args.class_name,
+        output_dir=args.output_dir,
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        use_8bit_adam=args.use_8bit_adam,
+        train_split_path=args.train_split,
+        lora_r=args.lora_r,
+    )

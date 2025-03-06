@@ -4,6 +4,13 @@ from pathlib import Path
 import shutil
 from tqdm import tqdm
 import random
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 def prepare_data_for_fine_tuning(
@@ -11,7 +18,9 @@ def prepare_data_for_fine_tuning(
     processed_images_path="data/processed_sd/images",
     output_dir="data/fine_tuning",
     val_split=0.1,
-    prompt_template="{lesion_type} skin lesion",
+    prompt_template="{lesion_type} skin lesion, dermatological photo, clinical image",  # Enhanced prompt
+    train_split_path=None,  # New parameter
+    test_split_path=None,  # New parameter
 ):
     """
     Prepare HAM10000 dataset for Stable Diffusion fine-tuning.
@@ -22,16 +31,31 @@ def prepare_data_for_fine_tuning(
         output_dir: Output directory for fine-tuning data
         val_split: Fraction of data to use for validation
         prompt_template: Template for generating prompts
+        train_split_path: Path to train split CSV (optional)
+        test_split_path: Path to test split CSV (optional)
     """
-    print("Preparing data for fine-tuning...")
+    logger.info("Preparing data for fine-tuning...")
 
     # Read metadata
     metadata = pd.read_csv(metadata_path)
-    print(f"Loaded metadata with {len(metadata)} entries")
+    logger.info(f"Loaded metadata with {len(metadata)} entries")
+
+    # If train/test splits are provided, use them
+    if train_split_path and os.path.exists(train_split_path):
+        logger.info(f"Using provided train split: {train_split_path}")
+        train_df = pd.read_csv(train_split_path)
+
+        # We'll use only training data for fine-tuning
+        metadata = train_df
+
+        # No need for val_split as we'll use test data for validation
+        val_split = 0.0
+
+        logger.info(f"Using {len(metadata)} images from train split")
 
     # Get unique lesion types
     lesion_types = metadata["dx"].unique()
-    print(f"Found {len(lesion_types)} lesion types: {', '.join(lesion_types)}")
+    logger.info(f"Found {len(lesion_types)} lesion types: {', '.join(lesion_types)}")
 
     # Create output directories
     train_dir = os.path.join(output_dir, "train")
@@ -42,6 +66,14 @@ def prepare_data_for_fine_tuning(
     # Create train and validation text files
     train_file = open(os.path.join(output_dir, "train.txt"), "w")
     val_file = open(os.path.join(output_dir, "val.txt"), "w")
+
+    # If we have a test split, use it for validation
+    test_image_ids = set()
+    if test_split_path and os.path.exists(test_split_path) and val_split == 0.0:
+        logger.info(f"Using provided test split for validation: {test_split_path}")
+        test_df = pd.read_csv(test_split_path)
+        test_image_ids = set(test_df["image_id"].tolist())
+        logger.info(f"Found {len(test_image_ids)} images in test split")
 
     # Process each image
     processed_files = set(os.listdir(processed_images_path))
@@ -63,11 +95,18 @@ def prepare_data_for_fine_tuning(
         if image_file is None:
             continue
 
-        # Create prompt
+        # Create prompt with more specific details
         prompt = prompt_template.format(lesion_type=lesion_type)
 
         # Decide train or validation
-        is_val = random.random() < val_split
+        is_val = False
+
+        # If using test split for validation
+        if test_image_ids:
+            is_val = image_id in test_image_ids
+        else:
+            # Use random split
+            is_val = random.random() < val_split
 
         # Copy image to appropriate directory
         src_path = os.path.join(processed_images_path, image_file)
@@ -86,11 +125,11 @@ def prepare_data_for_fine_tuning(
     val_file.close()
 
     # Print statistics
-    print("\nData preparation completed:")
-    print(f"Total images processed: {sum(count_by_type.values())}")
-    print("Images per lesion type:")
+    logger.info("\nData preparation completed:")
+    logger.info(f"Total images processed: {sum(count_by_type.values())}")
+    logger.info("Images per lesion type:")
     for lesion_type, count in count_by_type.items():
-        print(f"  - {lesion_type}: {count}")
+        logger.info(f"  - {lesion_type}: {count}")
 
     return lesion_types
 
@@ -100,7 +139,8 @@ def create_class_specific_data(
     metadata_path="data/raw/HAM10000_metadata.csv",
     processed_images_path="data/processed_sd/images",
     output_dir="data/fine_tuning_class_specific",
-    prompt_template="{lesion_type} skin lesion, dermatology image",
+    prompt_template="{lesion_type} skin lesion, dermatological photo, clinical image, centered, high detail, realistic texture",  # Enhanced prompt
+    train_split_path=None,  # New parameter
 ):
     """
     Create a dataset focused on a specific lesion class for targeted fine-tuning.
@@ -111,19 +151,38 @@ def create_class_specific_data(
         processed_images_path: Path to processed 512x512 images
         output_dir: Output directory for fine-tuning data
         prompt_template: Template for generating prompts
+        train_split_path: Path to train split CSV (optional)
     """
-    print(f"Preparing class-specific data for: {specific_class}")
+    logger.info(f"Preparing class-specific data for: {specific_class}")
 
     # Read metadata
     metadata = pd.read_csv(metadata_path)
 
     # Filter for specific class
     class_metadata = metadata[metadata["dx"] == specific_class]
-    print(f"Found {len(class_metadata)} images for class '{specific_class}'")
+
+    # If train split is provided, use only training images
+    if train_split_path and os.path.exists(train_split_path):
+        logger.info(f"Using provided train split: {train_split_path}")
+        train_df = pd.read_csv(train_split_path)
+        train_df = train_df[train_df["dx"] == specific_class]
+
+        if len(train_df) > 0:
+            logger.info(
+                f"Using {len(train_df)} images from train split for class '{specific_class}'"
+            )
+            class_metadata = train_df
+        else:
+            logger.warning(
+                f"Warning: No images of class '{specific_class}' found in train split"
+            )
+            # Continue with all images of this class if none found in train split
+
+    logger.info(f"Found {len(class_metadata)} images for class '{specific_class}'")
 
     if len(class_metadata) == 0:
-        print(f"Error: No images found for class '{specific_class}'")
-        print(f"Available classes: {', '.join(metadata['dx'].unique())}")
+        logger.error(f"Error: No images found for class '{specific_class}'")
+        logger.error(f"Available classes: {', '.join(metadata['dx'].unique())}")
         return None
 
     # Create output directory
@@ -166,7 +225,7 @@ def create_class_specific_data(
             f.write(f"{image_file},{prompt}\n")
             count += 1
 
-    print(f"\nPrepared {count} images for class '{specific_class}'")
+    logger.info(f"\nPrepared {count} images for class '{specific_class}'")
     return prompt_file
 
 
@@ -182,16 +241,34 @@ if __name__ == "__main__":
         default=None,
         help="Specific lesion class to prepare",
     )
+    parser.add_argument(
+        "--train_split",
+        type=str,
+        default=None,
+        help="Path to train split CSV",
+    )
+    parser.add_argument(
+        "--test_split",
+        type=str,
+        default=None,
+        help="Path to test split CSV",
+    )
     args = parser.parse_args()
 
     if args.specific_class:
-        create_class_specific_data(args.specific_class)
+        create_class_specific_data(
+            args.specific_class, train_split_path=args.train_split
+        )
     else:
         # Get available lesion types
-        lesion_types = prepare_data_for_fine_tuning()
+        lesion_types = prepare_data_for_fine_tuning(
+            train_split_path=args.train_split, test_split_path=args.test_split
+        )
 
         # Example: Create dataset for a specific class
         if lesion_types is not None and len(lesion_types) > 0:
             # You can change this to any class you want to focus on
             specific_class = lesion_types[0]  # e.g., 'dermatofibroma'
-            create_class_specific_data(specific_class)
+            create_class_specific_data(
+                specific_class, train_split_path=args.train_split
+            )
