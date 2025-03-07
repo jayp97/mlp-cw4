@@ -29,7 +29,7 @@ CONFIG = {
     "model_id": "runwayml/stable-diffusion-v1-5",
     "seed": 42,
     "lora_r": 8,  # Reduced from 16 to 8
-    "mixed_precision": "bf16",
+    "mixed_precision": "fp16",  # Changed to fp16 instead of bf16
     "guidance_scale": 7.5,
     "inference_steps": 50,  # Reduced from 75 to 50
     "target_modules_preset": "efficient",

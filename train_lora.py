@@ -100,7 +100,7 @@ def train_lora(
     num_epochs=40,  # Reduced from 75 to 40
     gradient_accumulation_steps=8,  # Increased from 4 to 8
     save_steps=500,
-    mixed_precision="bf16",
+    mixed_precision="fp16",  # Changed to fp16 from bf16 for better compatibility
     seed=42,
     lora_r=8,  # Reduced from 16 to 8
     lora_alpha=32,
@@ -159,7 +159,13 @@ def train_lora(
         writer = csv.writer(f)
         writer.writerow(["epoch", "step", "loss", "timestamp"])
 
-    # Initialize Accelerator
+    # Initialize Accelerator - using fp16 for better compatibility
+    compute_dtype = (
+        torch.float16
+        if mixed_precision == "fp16"
+        else torch.bfloat16 if mixed_precision == "bf16" else torch.float32
+    )
+
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=mixed_precision,
@@ -174,10 +180,8 @@ def train_lora(
     # Load UNet
     unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
 
-    # Load VAE (with reduced precision to save memory)
-    vae = AutoencoderKL.from_pretrained(
-        model_id, subfolder="vae", torch_dtype=torch.float16
-    )
+    # Load VAE (consistent with accelerator precision)
+    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
 
     # Freeze parameters
     unet.requires_grad_(False)
@@ -382,9 +386,7 @@ def train_lora(
 
                 # Encode images to latent space (with memory optimization)
                 with torch.no_grad():
-                    # Use lower precision for VAE to save memory
-                    if pixel_values.dtype != torch.float16:
-                        pixel_values = pixel_values.half()
+                    # Don't convert the dtype here to avoid issues
                     latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
 
                 # Sample noise
@@ -627,7 +629,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="bf16",
+        default="fp16",
         choices=["no", "fp16", "bf16"],
         help="Mixed precision mode",
     )
