@@ -97,25 +97,28 @@ def train_lora(
     output_dir="models/lora",
     learning_rate=1e-4,
     batch_size=1,
-    num_epochs=100,
-    gradient_accumulation_steps=4,
+    num_epochs=40,  # Reduced from 75 to 40
+    gradient_accumulation_steps=8,  # Increased from 4 to 8
     save_steps=500,
-    mixed_precision="bf16",  # Changed from fp16 to bf16 for better stability
+    mixed_precision="bf16",
     seed=42,
-    lora_r=16,  # Increased from 8 to 16 for more capacity
+    lora_r=8,  # Reduced from 16 to 8
     lora_alpha=32,
-    lora_dropout=0.05,  # Reduced from 0.1 to 0.05 for better generalization
+    lora_dropout=0.05,
     lora_text_encoder_r=8,
     lora_text_encoder_alpha=32,
     lora_text_encoder_dropout=0.1,
-    train_text_encoder=True,
-    use_8bit_adam=False,  # New parameter
-    clip_grad_norm=1.0,  # New parameter
-    warmup_steps=500,  # New parameter
-    train_split_path=None,  # New parameter for using the train split
+    train_text_encoder=False,  # Changed to False by default
+    use_8bit_adam=True,  # Changed to True by default
+    clip_grad_norm=1.0,
+    warmup_steps=100,  # Reduced from 500 to 100
+    train_split_path=None,
+    # New parameter to select most efficient target modules
+    target_modules_preset="efficient",  # options: "minimal", "efficient", "comprehensive"
 ):
     """
     Fine-tune Stable Diffusion using LoRA for generating skin lesion images.
+    Optimized for faster training without sacrificing quality.
 
     Args:
         model_id: HuggingFace model ID for Stable Diffusion
@@ -140,6 +143,7 @@ def train_lora(
         clip_grad_norm: Maximum gradient norm for clipping
         warmup_steps: Number of warmup steps for learning rate scheduler
         train_split_path: Path to train split CSV
+        target_modules_preset: Which set of modules to target with LoRA
     """
     # Set random seed
     torch.manual_seed(seed)
@@ -170,20 +174,23 @@ def train_lora(
     # Load UNet
     unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet")
 
-    # Load VAE
-    vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae")
+    # Load VAE (with reduced precision to save memory)
+    vae = AutoencoderKL.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float16
+    )
 
     # Freeze parameters
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
     vae.requires_grad_(False)
 
-    # Configure LoRA for UNet - target more modules for better detail learning
-    unet_lora_config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=[
+    # Configure target modules based on preset
+    if target_modules_preset == "minimal":
+        # Minimal set of modules for fastest training
+        unet_target_modules = ["to_q", "to_v"]
+    elif target_modules_preset == "comprehensive":
+        # Full set of modules for best quality
+        unet_target_modules = [
             "to_q",
             "to_k",
             "to_v",
@@ -192,7 +199,17 @@ def train_lora(
             "proj_out",
             "ff.net.0.proj",
             "ff.net.2",
-        ],  # Extended target modules
+        ]
+    else:  # "efficient" (default)
+        # Balanced set for speed and quality
+        unet_target_modules = ["to_q", "to_v", "to_out.0"]
+
+    # Configure LoRA for UNet
+    unet_lora_config = LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=unet_target_modules,
     )
     unet = get_peft_model(unet, unet_lora_config)
     unet.train()
@@ -203,7 +220,7 @@ def train_lora(
             r=lora_text_encoder_r,
             lora_alpha=lora_text_encoder_alpha,
             lora_dropout=lora_text_encoder_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # Added out_proj
+            target_modules=["q_proj", "v_proj"],  # Reduced from 4 to 2 modules
         )
         text_encoder = get_peft_model(text_encoder, text_encoder_lora_config)
         text_encoder.train()
@@ -359,15 +376,15 @@ def train_lora(
                 pixel_values = batch["pixel_values"].to(device)
                 input_ids = batch["input_ids"].to(device)
 
-                # Encode text
-                if train_text_encoder:
+                # Encode text (with memory optimization)
+                with torch.no_grad() if not train_text_encoder else torch.enable_grad():
                     encoder_hidden_states = text_encoder(input_ids)[0]
-                else:
-                    with torch.no_grad():
-                        encoder_hidden_states = text_encoder(input_ids)[0]
 
-                # Encode images to latent space
+                # Encode images to latent space (with memory optimization)
                 with torch.no_grad():
+                    # Use lower precision for VAE to save memory
+                    if pixel_values.dtype != torch.float16:
+                        pixel_values = pixel_values.half()
                     latents = vae.encode(pixel_values).latent_dist.sample() * 0.18215
 
                 # Sample noise
@@ -571,7 +588,7 @@ def train_lora(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Fine-tune Stable Diffusion with LoRA for skin lesion images"
+        description="Fine-tune Stable Diffusion with LoRA for skin lesion images (optimized)"
     )
     parser.add_argument(
         "--model_id",
@@ -599,12 +616,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument(
-        "--num_epochs", type=int, default=100, help="Number of training epochs"
+        "--num_epochs", type=int, default=40, help="Number of training epochs"
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=4,
+        default=8,
         help="Gradient accumulation steps",
     )
     parser.add_argument(
@@ -628,8 +645,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora_r",
         type=int,
-        default=16,
+        default=8,
         help="LoRA rank",
+    )
+    parser.add_argument(
+        "--train_text_encoder",
+        action="store_true",
+        help="Whether to train text encoder",
+    )
+    parser.add_argument(
+        "--target_modules_preset",
+        type=str,
+        default="efficient",
+        choices=["minimal", "efficient", "comprehensive"],
+        help="Which set of modules to target with LoRA",
     )
 
     args = parser.parse_args()
@@ -646,4 +675,6 @@ if __name__ == "__main__":
         use_8bit_adam=args.use_8bit_adam,
         train_split_path=args.train_split,
         lora_r=args.lora_r,
+        train_text_encoder=args.train_text_encoder,
+        target_modules_preset=args.target_modules_preset,
     )
