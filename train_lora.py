@@ -166,14 +166,10 @@ def train_lora(
         else torch.bfloat16 if mixed_precision == "bf16" else torch.float32
     )
 
-    # Configure accelerator with gradient clipping
+    # Configure accelerator simply - no gradient clipping
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         mixed_precision=mixed_precision,
-        # Add gradient_clipping here instead of doing it manually
-        kwargs_handlers=(
-            [{"clip_grad_norm": clip_grad_norm}] if clip_grad_norm > 0 else None
-        ),
     )
 
     # Load tokenizer
@@ -420,7 +416,7 @@ def train_lora(
                 # Backward pass and optimization
                 accelerator.backward(loss)
 
-                # Update parameters (gradient clipping is handled by accelerator)
+                # Update parameters
                 optimizer.step()
                 lr_scheduler.step()  # Update learning rate
                 optimizer.zero_grad()
