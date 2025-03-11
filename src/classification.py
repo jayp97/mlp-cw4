@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim .lr_scheduler import CosineAnnealingLR
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from PIL import Image
 import pandas as pd
 from tqdm import tqdm
@@ -228,10 +228,13 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
 
 
 def train_efficientnetv2(
+    combine_train_val=True,
     synthetic_ratio=0.0,
-    num_epochs=5,
-    batch_size=16,
+    num_epochs=20,
+    batch_size=64,
     learning_rate=1e-4,
+    weight_decay_init = 0.7,
+    weight_decay = 0.01,
     checkpoint_name="efficientnet_v2.pth",
     train_dir="../data/processed/images/train",
     val_dir="../data/processed/images/val",
@@ -243,7 +246,7 @@ def train_efficientnetv2(
 
     Flow:
       - Create train/val/test datasets & loaders
-      - Train with a validation pass each epoch
+      - Train on each epoch with gradual unfreezing
       - Evaluate on test at the end
       - Save final checkpoint
     """
@@ -277,7 +280,7 @@ def train_efficientnetv2(
     val_dataset = SkinLesionDataset(
         root_dir=val_dir,
         metadata_csv="../data/raw/HAM10000_metadata.csv",
-        transform=eval_transform,
+        transform=train_transform if combine_train_val else eval_transform,
         synthetic_ratio=0.0,    # no synthetic
         is_train=False
     )
@@ -294,12 +297,23 @@ def train_efficientnetv2(
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
-    print(f"Train set: {len(train_dataset)} samples")
-    print(f"Val   set: {len(val_dataset)} samples")
-    print(f"Test  set: {len(test_dataset)} samples")
+    # Create DataLoaders: if combining, combine train and val datasets
+    if combine_train_val:
+        combined_dataset = ConcatDataset([train_dataset, val_dataset])
+        train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
+        # For evaluation during training, we'll use the test set
+        eval_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        print(f"Combined Train+Val set: {len(combined_dataset)} samples")
+        print(f"Test set: {len(test_dataset)} samples")
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+        print(f"Train set: {len(train_dataset)} samples")
+        print(f"Val   set: {len(val_dataset)} samples")
+        print(f"Test  set: {len(test_dataset)} samples")
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.7)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay_init)
 
     # Training Loop
     for epoch in range(num_epochs):
@@ -309,20 +323,20 @@ def train_efficientnetv2(
             for param in model.blocks[-2:].parameters():
                 param.requires_grad = True
 
-
+            # Re-create the optimizer so it now tracks newly unfrozen params
             optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                                     lr=learning_rate * 0.1,  # lower lr after unfreeze
-                                    weight_decay=0.01)
+                                    weight_decay=weight_decay)
 
         elif epoch == 10:
-            print("[INFO] Unfreezing all layers EfficientNetV2...")
+            print("[INFO] Unfreezing third last block of EfficientNetV2...")
             for param in model.blocks[-3].parameters():
                 param.requires_grad = True
 
             # Re-create the optimizer so it now tracks newly unfrozen params
             optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                                    lr=learning_rate * 0.01,  # lower lr after unfreeze
-                                    weight_decay=0.01)
+                                    lr=learning_rate * 0.01,  # even lower lr after unfreeze
+                                    weight_decay=weight_decay)
             scheduler = CosineAnnealingLR(optimizer, T_max=10)
 
 
@@ -345,11 +359,12 @@ def train_efficientnetv2(
 
         # End of epoch => compute train loss & do validation
         train_loss = running_loss / len(train_loader)
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device=device)
-
         print(f"\nEpoch [{epoch+1}/{num_epochs}]")
         print(f"  Train Loss: {train_loss:.4f}")
-        print(f"  Val   Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+
+        if combine_train_val == False:
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device=device)
+            print(f"  Val   Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
 
     # Final test evaluation
     test_loss, test_acc = evaluate(model, test_loader, criterion, device=device)
@@ -357,25 +372,37 @@ def train_efficientnetv2(
 
     _ = evaluate_test_metrics(model, test_loader, device=device)
 
-    # Save the checkpoint
-    os.makedirs("models/efficientnet_checkpoints/", exist_ok=True)
-    ckpt_path = os.path.join("models/efficientnet_checkpoints/", checkpoint_name)
-    torch.save(model.state_dict(), ckpt_path)
-    print(f"Model saved to {ckpt_path}")
+    # Save the checkpoint only if using combined training + evaluation set
+    if combine_train_val:
+        os.makedirs("models/efficientnet_checkpoints/", exist_ok=True)
+        ckpt_path = os.path.join("models/efficientnet_checkpoints/", checkpoint_name)
+        torch.save(model.state_dict(), ckpt_path)
+        print(f"Model saved to {ckpt_path}")
 
 
 def main():
-    """
-    If run directly, we'll do a sample training with ratio=0.0 (i.e. no synthetic).
-    """
-    train_efficientnetv2(
-        synthetic_ratio=0.0,
-        num_epochs=40,
-        batch_size=128,
-        learning_rate=1e-2,
-        checkpoint_name="efficientnet_v2_synth_0.0.pth",
-    )
+    parser = argparse.ArgumentParser(description="Train EfficientNetV2 on the HAM10000 dataset.")
+    parser.add_argument("--combine_train_val", type=lambda x: bool(strtobool(x)), default=True, help="Combine training and validation sets (True or False).")
+    parser.add_argument("--synthetic_ratio", type=float, default=0.0, help="Synthetic ratio for training data.")
+    parser.add_argument("--num_epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer.")
+    parser.add_argument("--weight_decay_init", type=float, default=0.7, help="Initial weight decay.")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for training.")
+    parser.add_argument("--checkpoint_name", type=str, default="efficientnet_v2.pth", help="Checkpoint filename.")
 
+    args = parser.parse_args()
+
+    train_efficientnetv2(
+        combine_train_val=args.combine_train_val,
+        synthetic_ratio=args.synthetic_ratio,
+        num_epochs=args.num_epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        weight_decay_init=args.weight_decay_init,
+        weight_decay=args.weight_decay,
+        checkpoint_name=args.checkpoint_name,
+    )
 
 if __name__ == "__main__":
     main()
