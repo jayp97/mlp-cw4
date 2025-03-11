@@ -15,14 +15,12 @@ from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
-from sklearn.metrics import (
-    precision_recall_fscore_support,
-    roc_auc_score,
-    accuracy_score
-)
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score
 from sklearn.preprocessing import label_binarize
 import timm
 import timm.data
+import argparse
+from distutils.util import strtobool
 
 
 class SkinLesionDataset(Dataset):
@@ -34,10 +32,10 @@ class SkinLesionDataset(Dataset):
     def __init__(
         self,
         root_dir,                     # e.g. ../data/processed/images/train
-        metadata_csv="../data/raw/HAM10000_metadata.csv",
+        metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=None,
         synthetic_ratio=0.0,
-        synthetic_dir="../data/synthetic/images_dermatofibroma/",
+        synthetic_dir="data/synthetic/images_dermatofibroma/",
         is_train=False
     ):
         super().__init__()
@@ -236,9 +234,9 @@ def train_efficientnetv2(
     weight_decay_init = 0.7,
     weight_decay = 0.01,
     checkpoint_name="efficientnet_v2.pth",
-    train_dir="../data/processed/images/train",
-    val_dir="../data/processed/images/val",
-    test_dir="../data/processed/images/test",
+    train_dir="data/processed/images/train",
+    val_dir="data/processed/images/val",
+    test_dir="data/processed/images/test",
 ):
     """
     Fine-tunes an EfficientNetV2-L model on train/val/test splits in separate folders.
@@ -271,22 +269,22 @@ def train_efficientnetv2(
     # Create Datasets
     train_dataset = SkinLesionDataset(
         root_dir=train_dir,
-        metadata_csv="../data/raw/HAM10000_metadata.csv",
+        metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=train_transform,
         synthetic_ratio=synthetic_ratio,  # Only train
-        synthetic_dir="../data/synthetic/images_dermatofibroma/",
+        synthetic_dir="data/synthetic/images_dermatofibroma/",
         is_train=True
     )
     val_dataset = SkinLesionDataset(
         root_dir=val_dir,
-        metadata_csv="../data/raw/HAM10000_metadata.csv",
+        metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=train_transform if combine_train_val else eval_transform,
         synthetic_ratio=0.0,    # no synthetic
         is_train=False
     )
     test_dataset = SkinLesionDataset(
         root_dir=test_dir,
-        metadata_csv="../data/raw/HAM10000_metadata.csv",
+        metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=eval_transform,
         synthetic_ratio=0.0,    # no synthetic
         is_train=False
