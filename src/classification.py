@@ -36,7 +36,9 @@ class SkinLesionDataset(Dataset):
         metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=None,
         synthetic_ceiling=0.0,
-        synthetic_dir="data/synthetic/images_dermatofibroma/",
+        augmented_ceiling=0.0,
+        synthetic_dir="data/synthetic/",
+        augmented_dir="data/augmented/",
         is_train=False
     ):
         super().__init__()
@@ -45,6 +47,7 @@ class SkinLesionDataset(Dataset):
         self.is_train = is_train
         self.synthetic_ceiling = synthetic_ceiling
         self.synthetic_dir = synthetic_dir
+        self.augmented_dir = augmented_dir
 
         # Load the metadata for ALL images
         df = pd.read_csv(metadata_csv)
@@ -64,10 +67,6 @@ class SkinLesionDataset(Dataset):
             if fn in filename_to_dx:
                 dx_str = filename_to_dx[fn]
                 data_list.append((fn, dx_str))
-            else:
-                # The folder has a .jpg not in CSV
-                # handle or skip as you like
-                pass
 
         # Sythetic images add if training mode 
         if is_train and synthetic_ceiling > 0:
@@ -105,12 +104,47 @@ class SkinLesionDataset(Dataset):
             synthetic_files = [
                 f for f in os.listdir(self.synthetic_dir) if f.endswith(".jpg")
             ]
+        elif is_train and augmented_ceiling>0:
+            real_counts = {
+                "df": sum(1 for _, dx in data_list if dx == "df"),
+                "akiec": sum(1 for _, dx in data_list if dx == "akiec"),
+                "vasc": sum(1 for _, dx in data_list if dx == "vasc"),
+            }
+
+            aug_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(60),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
+                transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
+                transforms.RandomAffine(degrees=45, shear=20, scale=(0.8, 1.2)),
+                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0),
+            ])
+            augmented_needed = {dx: max(0, augmented_ceiling - real_counts[dx]) for dx in real_counts}
+
+            for lesion_type, needed in augmented_needed.items():
+                if needed > 0:
+                    original_images = [fn for fn, dx in data_list if dx == lesion_type]
+                    selected_images = random.choices(original_images, k=needed)
+
+                    for fn in selected_images:
+                        img_path = os.path.join(self.root_dir, fn)
+                        image = Image.open(img_path).convert("RGB")  # Load image
+                        
+                        augmented_image = aug_transform(image)  # Apply augmentations
+                        
+                        # Save augmented image with new filename
+                        new_fn = f"aug_{fn}"
+                        aug_path = os.path.join(self.augmented_dir, new_fn)
+                        augmented_image.save(aug_path)
+
+                        # Add new augmented image to dataset
+                        data_list.append((new_fn, lesion_type))
 
 
         self.data_list = data_list
 
 
-        self.label_map = {
+        self.label_map = { 
             "akiec": 0, "bcc": 1, "bkl": 2, "df": 3,
             "mel": 4,  "nv": 5,  "vasc": 6
         }
@@ -132,11 +166,13 @@ class SkinLesionDataset(Dataset):
     def __getitem__(self, idx):
         fn, dx_str = self.data_list[idx]
         label = self.label_map[dx_str]
+        is_augmented = "_aug" in dx_str
+        is_synthetic = "synth" in dx_str
 
-        # If it's a synthetic file (exists in synthetic_dir), load from there
-        synthetic_path = os.path.join(self.synthetic_dir, fn)
-        if os.path.exists(synthetic_path):
-            img_path = synthetic_path
+        if is_synthetic:
+            img_path = os.path.join(self.synthetic_dir, fn)
+        elif is_augmented:
+            img_path = os.path.join(self.augmented_dir, fn)
         else:
             # else it's a real file in root_dir
             img_path = os.path.join(self.root_dir, fn)
@@ -181,9 +217,7 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
     Returns a dict of metrics, and prints them nicely.
     """
     model.eval()
-    all_labels = []
-    all_preds = []
-    all_probs = []
+    all_labels = []efficientnet_v2
 
     with torch.no_grad():
         for images, labels in dataloader:
