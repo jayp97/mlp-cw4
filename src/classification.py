@@ -21,6 +21,7 @@ import timm
 import timm.data
 import argparse
 from distutils.util import strtobool
+import random
 
 
 class SkinLesionDataset(Dataset):
@@ -34,7 +35,7 @@ class SkinLesionDataset(Dataset):
         root_dir,                     # e.g. ../data/processed/images/train
         metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=None,
-        synthetic_ratio=0.0,
+        synthetic_ceiling=0.0,
         synthetic_dir="data/synthetic/images_dermatofibroma/",
         is_train=False
     ):
@@ -42,7 +43,7 @@ class SkinLesionDataset(Dataset):
         self.root_dir = root_dir
         self.transform = transform
         self.is_train = is_train
-        self.synthetic_ratio = synthetic_ratio
+        self.synthetic_ceiling = synthetic_ceiling
         self.synthetic_dir = synthetic_dir
 
         # Load the metadata for ALL images
@@ -69,26 +70,42 @@ class SkinLesionDataset(Dataset):
                 pass
 
         # Sythetic images add if training mode 
-        if is_train and synthetic_ratio > 0:
-            # Count how many DF images we have in data_list
+        if is_train and synthetic_ceiling > 0:
             real_df_count = sum(1 for (_, dx) in data_list if dx == "df")
-            synthetic_needed = int(round(real_df_count * synthetic_ratio))
+            real_akiec_count = sum(1 for (_, dx) in data_list if dx == "akiec")
+            real_vasc_count = sum(1 for (_, dx) in data_list if dx == "vasc")
+
+            # Determine how many synthetic images are needed
+            synthetic_needed_df = max(0, synthetic_ceiling - real_df_count)
+            synthetic_needed_akiec = max(0, synthetic_ceiling - real_akiec_count)
+            synthetic_needed_vasc = max(0, synthetic_ceiling - real_vasc_count)
+
+            # Gather all synthetic images
+            synthetic_files = [f for f in os.listdir(self.synthetic_dir) if f.endswith(".jpg")]
+
+            # Select and add synthetic images for 'df'
+            if synthetic_needed_df > 0:
+                synthetic_df_files = [f for f in synthetic_files if "df" in f]
+                synthetic_selected_df = random.sample(synthetic_df_files, min(len(synthetic_df_files), synthetic_needed_df))
+                data_list.extend([(fn, "df_synth") for fn in synthetic_selected_df])
+
+            # Select and add synthetic images for 'akiec'
+            if synthetic_needed_akiec > 0:
+                synthetic_akiec_files = [f for f in synthetic_files if "akiec" in f]
+                synthetic_selected_akiec = random.sample(synthetic_akiec_files, min(len(synthetic_akiec_files), synthetic_needed_akiec))
+                data_list.extend([(fn, "akiec_synth") for fn in synthetic_selected_akiec])
+
+            # Select and add synthetic images for 'vasc'
+            if synthetic_needed_vasc > 0:
+                synthetic_vasc_files = [f for f in synthetic_files if "vasc" in f]
+                synthetic_selected_vasc = random.sample(synthetic_vasc_files, min(len(synthetic_vasc_files), synthetic_needed_vasc))
+                data_list.extend([(fn, "vasc_synth") for fn in synthetic_selected_vasc])
 
             # Gather all synthetic images
             synthetic_files = [
                 f for f in os.listdir(self.synthetic_dir) if f.endswith(".jpg")
             ]
 
-            if len(synthetic_files) == 0 and synthetic_needed > 0:
-                print(f"[WARNING] No synthetic images in {self.synthetic_dir}")
-
-            if synthetic_needed > 0 and len(synthetic_files) > 0:
-                factor = (synthetic_needed // len(synthetic_files)) + 1
-                extended_list = synthetic_files * factor
-                extended_list = extended_list[:synthetic_needed]
-
-                for syn_fn in extended_list:
-                    data_list.append((syn_fn, "df"))
 
         self.data_list = data_list
 
@@ -230,7 +247,7 @@ def train_efficientnetv2(
     synthetic_ratio=0.0,
     num_epochs=20,
     batch_size=64,
-    learning_rate=1e-4,
+    learning_rate=5e-3,
     weight_decay_init = 0.7,
     weight_decay = 0.01,
     checkpoint_name="efficientnet_v2.pth",
@@ -263,7 +280,7 @@ def train_efficientnetv2(
 
     # Data transforms , is_training False means no augmentation
     data_config    = timm.data.resolve_data_config({}, model=model)
-    train_transform = timm.data.create_transform(**data_config, is_training=False)
+    train_transform = timm.data.create_transform(**data_config, is_training=True)
     eval_transform  = timm.data.create_transform(**data_config, is_training=False)
 
     # Create Datasets
@@ -335,7 +352,7 @@ def train_efficientnetv2(
             optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                                     lr=learning_rate * 0.01,  # even lower lr after unfreeze
                                     weight_decay=weight_decay)
-            scheduler = CosineAnnealingLR(optimizer, T_max=10)
+            #scheduler = CosineAnnealingLR(optimizer, T_max=10)
 
 
                         
@@ -350,8 +367,8 @@ def train_efficientnetv2(
             loss.backward()
             optimizer.step()
 
-            if epoch>=10:
-                scheduler.step()
+            #if epoch>=10:
+                #scheduler.step()
 
             running_loss += loss.item()
 
@@ -363,6 +380,9 @@ def train_efficientnetv2(
         if combine_train_val == False:
             val_loss, val_acc = evaluate(model, val_loader, criterion, device=device)
             print(f"  Val   Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+        else:
+            test_loss, test_acc = evaluate(model, eval_loader, criterion, device=device)
+            print(f"  Test   Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
 
     # Final test evaluation
     test_loss, test_acc = evaluate(model, test_loader, criterion, device=device)
@@ -382,9 +402,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train EfficientNetV2 on the HAM10000 dataset.")
     parser.add_argument("--combine_train_val", type=lambda x: bool(strtobool(x)), default=True, help="Combine training and validation sets (True or False).")
     parser.add_argument("--synthetic_ratio", type=float, default=0.0, help="Synthetic ratio for training data.")
-    parser.add_argument("--num_epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument("--num_epochs", type=int, default=25, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate for the optimizer.")
+    parser.add_argument("--learning_rate", type=float, default=5e-3, help="Learning rate for the optimizer.")
     parser.add_argument("--weight_decay_init", type=float, default=0.7, help="Initial weight decay.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for training.")
     parser.add_argument("--checkpoint_name", type=str, default="efficientnet_v2.pth", help="Checkpoint filename.")
