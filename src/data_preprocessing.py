@@ -20,6 +20,9 @@ from sklearn.model_selection import train_test_split
 RAW_IMAGES_PATH = "../data/raw/images/"
 METADATA_PATH = "../data/raw/HAM10000_metadata.csv"
 PROCESSED_PATH = "../data/processed/images/"
+SYNTHETIC_PATH = "../data/synthetic_by_class/synthetic"
+PROCESSED_SYNTHETIC = "../data/processed_synth"
+
 IMG_SIZE = (256,256) # classification
 TRAIN_TEST_SPLIT = 0.2
 
@@ -99,6 +102,36 @@ def preprocess_images():
         # Save in the chosen subfolder
         save_path = os.path.join(save_folder, base_name)
         cv2.imwrite(save_path, img_resized)
+
+    print("Done resizing and splitting images stratified by dx.")
+
+    image_paths = glob(os.path.join(SYNTHETIC_PATH, "*.png"))
+
+    for img_path in tqdm(image_paths, desc=f"Resizing images to {IMG_SIZE}"):
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Warning: Could not read {img_path}")
+            continue
+
+        # Convert the image to JPG by saving it as a temporary .jpg file
+        temp_jpg_path = img_path.replace(".png", ".jpg")
+        cv2.imwrite(temp_jpg_path, img)
+
+        # Read the image back as a jpg
+        img = cv2.imread(temp_jpg_path)
+
+        # Resize the image
+        img_resized = cv2.resize(img, IMG_SIZE)
+
+        # Get the base name (without extension) and append .jpg
+        base_name = os.path.basename(img_path).replace(".png", ".jpg")
+
+        # Save the resized image to the processed folder as .jpg
+        save_path = os.path.join(PROCESSED_SYNTHETIC, base_name)
+        cv2.imwrite(save_path, img_resized)
+
+        # Optionally, remove the temporary jpg file after saving
+        os.remove(temp_jpg_path)
 
     print("Done resizing and splitting images stratified by dx.")
 
