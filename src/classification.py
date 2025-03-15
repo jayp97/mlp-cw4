@@ -11,17 +11,22 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim .lr_scheduler import CosineAnnealingLR
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torchvision import transforms
 from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score, confusion_matrix
 from sklearn.preprocessing import label_binarize
 import timm
 import timm.data
 import argparse
 from distutils.util import strtobool
 import random
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+import shutil
 
 
 class SkinLesionDataset(Dataset):
@@ -37,7 +42,7 @@ class SkinLesionDataset(Dataset):
         transform=None,
         synthetic_ceiling=0.0,
         augmented_ceiling=0.0,
-        synthetic_dir="data/synthetic/",
+        synthetic_dir="data/processed_synth/",
         augmented_dir="data/augmented/",
         is_train=False
     ):
@@ -75,9 +80,9 @@ class SkinLesionDataset(Dataset):
             real_vasc_count = sum(1 for (_, dx) in data_list if dx == "vasc")
 
             # Determine how many synthetic images are needed
-            synthetic_needed_df = max(0, synthetic_ceiling - real_df_count)
-            synthetic_needed_akiec = max(0, synthetic_ceiling - real_akiec_count)
-            synthetic_needed_vasc = max(0, synthetic_ceiling - real_vasc_count)
+            synthetic_needed_df = int(max(0, synthetic_ceiling - real_df_count))
+            synthetic_needed_akiec = int(max(0, synthetic_ceiling - real_akiec_count))
+            synthetic_needed_vasc = int(max(0, synthetic_ceiling - real_vasc_count))
 
             # Gather all synthetic images
             synthetic_files = [f for f in os.listdir(self.synthetic_dir) if f.endswith(".jpg")]
@@ -86,19 +91,19 @@ class SkinLesionDataset(Dataset):
             if synthetic_needed_df > 0:
                 synthetic_df_files = [f for f in synthetic_files if "df" in f]
                 synthetic_selected_df = random.sample(synthetic_df_files, min(len(synthetic_df_files), synthetic_needed_df))
-                data_list.extend([(fn, "df_synth") for fn in synthetic_selected_df])
+                data_list.extend([(f"synth_{fn}", "df") for fn in synthetic_selected_df])
 
             # Select and add synthetic images for 'akiec'
             if synthetic_needed_akiec > 0:
                 synthetic_akiec_files = [f for f in synthetic_files if "akiec" in f]
                 synthetic_selected_akiec = random.sample(synthetic_akiec_files, min(len(synthetic_akiec_files), synthetic_needed_akiec))
-                data_list.extend([(fn, "akiec_synth") for fn in synthetic_selected_akiec])
+                data_list.extend([(f"synth_{fn}", "akiec") for fn in synthetic_selected_akiec])
 
             # Select and add synthetic images for 'vasc'
             if synthetic_needed_vasc > 0:
                 synthetic_vasc_files = [f for f in synthetic_files if "vasc" in f]
                 synthetic_selected_vasc = random.sample(synthetic_vasc_files, min(len(synthetic_vasc_files), synthetic_needed_vasc))
-                data_list.extend([(fn, "vasc_synth") for fn in synthetic_selected_vasc])
+                data_list.extend([(f"synth_{fn}", "vasc") for fn in synthetic_selected_vasc])
 
             # Gather all synthetic images
             synthetic_files = [
@@ -117,14 +122,15 @@ class SkinLesionDataset(Dataset):
                 transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
                 transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
                 transforms.RandomAffine(degrees=45, shear=20, scale=(0.8, 1.2)),
-                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0),
             ])
+
+            
             augmented_needed = {dx: max(0, augmented_ceiling - real_counts[dx]) for dx in real_counts}
 
             for lesion_type, needed in augmented_needed.items():
                 if needed > 0:
                     original_images = [fn for fn, dx in data_list if dx == lesion_type]
-                    selected_images = random.choices(original_images, k=needed)
+                    selected_images = random.choices(original_images, k=int(needed))
 
                     for fn in selected_images:
                         img_path = os.path.join(self.root_dir, fn)
@@ -166,13 +172,15 @@ class SkinLesionDataset(Dataset):
     def __getitem__(self, idx):
         fn, dx_str = self.data_list[idx]
         label = self.label_map[dx_str]
-        is_augmented = "_aug" in dx_str
-        is_synthetic = "synth" in dx_str
+        is_augmented = "aug" in fn
+        is_synthetic = "synth" in fn
 
         if is_synthetic:
-            img_path = os.path.join(self.synthetic_dir, fn)
+            fn_without_synth = fn.removeprefix("synth_")
+            img_path = os.path.join(self.synthetic_dir, fn_without_synth)
         elif is_augmented:
-            img_path = os.path.join(self.augmented_dir, fn)
+            fn_without_synth = fn.removeprefix("synth_")
+            img_path = os.path.join(self.augmented_dir, fn_without_synth)
         else:
             # else it's a real file in root_dir
             img_path = os.path.join(self.root_dir, fn)
@@ -217,7 +225,9 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
     Returns a dict of metrics, and prints them nicely.
     """
     model.eval()
-    all_labels = []efficientnet_v2
+    all_labels = []
+    all_preds = []
+    all_probs = []
 
     with torch.no_grad():
         for images, labels in dataloader:
@@ -235,7 +245,20 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
     all_preds  = np.concatenate(all_preds)
     all_probs  = np.concatenate(all_probs, axis=0)
 
+        # Confusion Matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    # Plot confusion matrix
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"], yticklabels=["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"])
+    plt.title("Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.savefig("confusion_matrix.png")  # Save the confusion matrix plot as an image
+    plt.show()  # Optionally show it interactively
+
     overall_acc = accuracy_score(all_labels, all_preds)
+
 
     # recision/Recall/F1 for each class
     class_precision, class_recall, class_f1, _ = precision_recall_fscore_support(
@@ -278,7 +301,8 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
 
 def train_efficientnetv2(
     combine_train_val=True,
-    synthetic_ratio=0.0,
+    synthetic_ceiling=0.0,
+    augmented_ceiling=0.0,
     num_epochs=20,
     batch_size=64,
     learning_rate=5e-3,
@@ -287,7 +311,9 @@ def train_efficientnetv2(
     checkpoint_name="efficientnet_v2.pth",
     train_dir="data/processed/images/train",
     val_dir="data/processed/images/val",
+    train_val_dir="data/processed/images/train_val",
     test_dir="data/processed/images/test",
+    synthetic_dir="data/processed_synth"
 ):
     """
     Fine-tunes an EfficientNetV2-L model on train/val/test splits in separate folders.
@@ -318,41 +344,49 @@ def train_efficientnetv2(
     eval_transform  = timm.data.create_transform(**data_config, is_training=False)
 
     # Create Datasets
-    train_dataset = SkinLesionDataset(
-        root_dir=train_dir,
-        metadata_csv="data/raw/HAM10000_metadata.csv",
-        transform=train_transform,
-        synthetic_ratio=synthetic_ratio,  # Only train
-        synthetic_dir="data/synthetic/images_dermatofibroma/",
-        is_train=True
-    )
-    val_dataset = SkinLesionDataset(
-        root_dir=val_dir,
-        metadata_csv="data/raw/HAM10000_metadata.csv",
-        transform=train_transform if combine_train_val else eval_transform,
-        synthetic_ratio=0.0,    # no synthetic
-        is_train=False
-    )
+    if combine_train_val: 
+        train_val_dataset = SkinLesionDataset(
+            root_dir=train_val_dir,
+            metadata_csv="data/raw/HAM10000_metadata.csv",
+            transform=train_transform,
+            synthetic_ceiling=synthetic_ceiling,  # Only train
+            augmented_ceiling=augmented_ceiling,
+            synthetic_dir=synthetic_dir,
+            is_train=True
+        )
+    else:
+        train_dataset = SkinLesionDataset(
+            root_dir=train_dir,
+            metadata_csv="data/raw/HAM10000_metadata.csv",
+            transform=train_transform,
+            synthetic_ceiling=synthetic_ceiling,  # Only train
+            synthetic_dir=synthetic_dir,
+            is_train=True
+        )
+        val_dataset = SkinLesionDataset(
+            root_dir=val_dir,
+            metadata_csv="data/raw/HAM10000_metadata.csv",
+            transform=train_transform if combine_train_val else eval_transform,
+            synthetic_ceiling=0.0,    # no synthetic
+            is_train=False
+        )
     test_dataset = SkinLesionDataset(
         root_dir=test_dir,
         metadata_csv="data/raw/HAM10000_metadata.csv",
         transform=eval_transform,
-        synthetic_ratio=0.0,    # no synthetic
+        synthetic_ceiling=0.0,    # no synthetic
         is_train=False
     )
 
     # Create DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
     # Create DataLoaders: if combining, combine train and val datasets
     if combine_train_val:
-        combined_dataset = ConcatDataset([train_dataset, val_dataset])
-        train_loader = DataLoader(combined_dataset, batch_size=batch_size, shuffle=True)
+        train_loader = DataLoader(train_val_dataset, batch_size=batch_size, shuffle=True)
         # For evaluation during training, we'll use the test set
         eval_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-        print(f"Combined Train+Val set: {len(combined_dataset)} samples")
+        print(f"Combined Train+Val set: {len(train_val_dataset)} samples")
         print(f"Test set: {len(test_dataset)} samples")
     else:
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -435,7 +469,8 @@ def train_efficientnetv2(
 def main():
     parser = argparse.ArgumentParser(description="Train EfficientNetV2 on the HAM10000 dataset.")
     parser.add_argument("--combine_train_val", type=lambda x: bool(strtobool(x)), default=True, help="Combine training and validation sets (True or False).")
-    parser.add_argument("--synthetic_ratio", type=float, default=0.0, help="Synthetic ratio for training data.")
+    parser.add_argument("--synthetic_ceiling", type=float, default=0.0, help="Synthetic ceiling for training data.")
+    parser.add_argument("--augmented_ceiling", type=float, default=0.0, help="augmented ceiling for training data.")
     parser.add_argument("--num_epochs", type=int, default=25, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=5e-3, help="Learning rate for the optimizer.")
@@ -447,7 +482,8 @@ def main():
 
     train_efficientnetv2(
         combine_train_val=args.combine_train_val,
-        synthetic_ratio=args.synthetic_ratio,
+        synthetic_ceiling=args.synthetic_ceiling,
+        augmented_ceiling=args.augmented_ceiling,
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
