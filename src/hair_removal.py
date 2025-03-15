@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from matplotlib import pyplot as plt
 
-image_path = '../data/images/ISIC_0024320.jpg'
+image_path = '../data/raw/images/ISIC_0024320.jpg'
 
 # Write a function to execute the dull razor algorithm
 def dull_razor(image_path, kernel_size=(17, 17), blur_ksize=(3, 3), inpaint_radius=10):
