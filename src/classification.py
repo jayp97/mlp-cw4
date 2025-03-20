@@ -16,7 +16,7 @@ from PIL import Image
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score, confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, accuracy_score, confusion_matrix, classification_report
 from sklearn.preprocessing import label_binarize
 import timm
 import timm.data
@@ -117,14 +117,15 @@ class SkinLesionDataset(Dataset):
             }
 
             aug_transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(60),
-                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
-                transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
-                transforms.RandomAffine(degrees=45, shear=20, scale=(0.8, 1.2)),
-            ])
+                transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+                transforms.RandomHorizontalFlip(0.5),
+                transforms.RandomVerticalFlip(0.5),
+                transforms.RandomRotation(15),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+                transforms.RandomAffine(degrees=10, shear=15, scale=(0.8, 1.2), translate=(0.2, 0.2))
+                ])
 
-            
+
             augmented_needed = {dx: max(0, augmented_ceiling - real_counts[dx]) for dx in real_counts}
 
             for lesion_type, needed in augmented_needed.items():
@@ -217,12 +218,14 @@ def evaluate(model, dataloader, criterion, device="cpu"):
 
 def evaluate_test_metrics(model, dataloader, device="cpu"):
     """
-    Computes:
-      - Overall Accuracy
-      - AUC-ROC (per class)
-      - Precision, Recall, F1 (per class)
+    Computes and prints:
+      - Overall accuracy
+      - Macro precision, recall, F1
+      - AUC-ROC per class, plus macro AUC
+      - Per-class precision, recall, F1
+      - Confusion matrix
 
-    Returns a dict of metrics, and prints them nicely.
+    Returns a dict of metrics.
     """
     model.eval()
     all_labels = []
@@ -245,59 +248,87 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
     all_preds  = np.concatenate(all_preds)
     all_probs  = np.concatenate(all_probs, axis=0)
 
-        # Confusion Matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    # Plot confusion matrix
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"], yticklabels=["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"])
-    plt.title("Confusion Matrix")
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.savefig("confusion_matrix.png")  # Save the confusion matrix plot as an image
-    plt.show()  # Optionally show it interactively
-
+    # Overall Accuracy
     overall_acc = accuracy_score(all_labels, all_preds)
 
-
-    # recision/Recall/F1 for each class
+    # Per-class metrics
     class_precision, class_recall, class_f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average=None, labels=[0,1,2,3,4,5,6]
     )
 
-    # AUC per class
-    y_true_bin = label_binarize(all_labels, classes=[0,1,2,3,4,5,6])  # shape => (N,7)
+    # Macro-average metrics
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='macro'
+    )
 
+    # AUC per class
+    y_true_bin = label_binarize(all_labels, classes=[0,1,2,3,4,5,6])
     roc_aucs = []
     for c in range(7):
         if y_true_bin[:, c].sum() == 0:
-            roc_aucs.append(float('nan'))
+            roc_aucs.append(float('nan'))  # No samples for this class
         else:
             auc_c = roc_auc_score(y_true_bin[:, c], all_probs[:, c])
             roc_aucs.append(auc_c)
 
+    # Macro-average AUC (ignoring NaN)
+    valid_aucs = [auc for auc in roc_aucs if not np.isnan(auc)]
+    if len(valid_aucs) > 0:
+        macro_auc = np.mean(valid_aucs)
+    else:
+        macro_auc = float('nan')
+
+    # Confusion Matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(8, 6))
     class_names = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues",
+        xticklabels=class_names, yticklabels=class_names
+    )
+    #  plt.title("Confusion Matrix")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.savefig("confusion_matrix_synth300.png")
+    plt.show()
+
+    # Print Summary
     print("\n===== DETAILED TEST METRICS =====")
-    print(f"Overall Accuracy: {overall_acc:.2f}")
+    print(f"Overall Accuracy: {overall_acc:.4f}")
+    print(f"Macro Precision: {macro_precision:.4f}")
+    print(f"Macro Recall:    {macro_recall:.4f}")
+    print(f"Macro F1-Score:  {macro_f1:.4f}")
+    print(f"Macro AUC:       {macro_auc:.4f}\n")
+
+    # Per-class metrics
     for i, cls_name in enumerate(class_names):
-        print(f"\nClass '{cls_name}':")
-        print(f"  Precision: {class_precision[i]:.2f}")
-        print(f"  Recall:    {class_recall[i]:.2f}")
-        print(f"  F1-Score:  {class_f1[i]:.2f}")
+        print(f"Class '{cls_name}':")
+        print(f"  Precision: {class_precision[i]:.4f}")
+        print(f"  Recall:    {class_recall[i]:.4f}")
+        print(f"  F1-Score:  {class_f1[i]:.4f}")
         if not np.isnan(roc_aucs[i]):
-            print(f"  AUC:       {roc_aucs[i]:.2f}")
+            print(f"  AUC:       {roc_aucs[i]:.4f}")
         else:
-            print(f"  AUC:       N/A (no samples)")
+            print("  AUC:       N/A (no samples)")
+        print()
+
+    # Optionally, you could also print a detailed classification report:
+    # print(classification_report(all_labels, all_preds, target_names=class_names))
 
     metrics_dict = {
         "overall_acc": overall_acc,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
+        "macro_auc": macro_auc,
         "precision_per_class": class_precision,
         "recall_per_class": class_recall,
         "f1_per_class": class_f1,
-        "auc_per_class": roc_aucs
+        "auc_per_class": roc_aucs,
+        "confusion_matrix": cm,
     }
-    return metrics_dict
 
+    return metrics_dict
 
 def train_efficientnetv2(
     combine_train_val=True,
@@ -471,7 +502,7 @@ def main():
     parser.add_argument("--combine_train_val", type=lambda x: bool(strtobool(x)), default=True, help="Combine training and validation sets (True or False).")
     parser.add_argument("--synthetic_ceiling", type=float, default=0.0, help="Synthetic ceiling for training data.")
     parser.add_argument("--augmented_ceiling", type=float, default=0.0, help="augmented ceiling for training data.")
-    parser.add_argument("--num_epochs", type=int, default=25, help="Number of training epochs.")
+    parser.add_argument("--num_epochs", type=int, default=20, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training.")
     parser.add_argument("--learning_rate", type=float, default=5e-3, help="Learning rate for the optimizer.")
     parser.add_argument("--weight_decay_init", type=float, default=0.7, help="Initial weight decay.")
