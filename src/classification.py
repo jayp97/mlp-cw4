@@ -289,7 +289,7 @@ def evaluate_test_metrics(model, dataloader, device="cpu"):
     #  plt.title("Confusion Matrix")
     plt.xlabel("Predicted")
     plt.ylabel("True")
-    plt.savefig("confusion_matrix_synth300.png")
+    plt.savefig("confusion_matrix_aug300.png")
     plt.show()
 
     # Print Summary
