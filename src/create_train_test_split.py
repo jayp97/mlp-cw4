@@ -53,7 +53,7 @@ def create_train_test_split(
     os.makedirs(os.path.join(output_dir, "train"), exist_ok=True)
     os.makedirs(os.path.join(output_dir, "test"), exist_ok=True)
 
-    # Initialize dataframes for train and test splits
+    # Initialise dataframes for train and test splits
     train_df = pd.DataFrame(columns=metadata.columns)
     test_df = pd.DataFrame(columns=metadata.columns)
 

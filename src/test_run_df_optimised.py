@@ -17,21 +17,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Optimized Configuration
+# Optimised Configuration
 CONFIG = {
     "specific_class": "df",
-    "num_epochs": 40,  # Reduced from 75 to 40
+    "num_epochs": 40,
     "num_images": 50,
     "batch_size": 1,
-    "gradient_accumulation_steps": 8,  # Increased from 4 to 8
+    "gradient_accumulation_steps": 8,
     "learning_rate": 5e-5,
     "output_dir": "results_df_optimized",
     "model_id": "runwayml/stable-diffusion-v1-5",
     "seed": 42,
-    "lora_r": 8,  # Reduced from 16 to 8
-    "mixed_precision": "fp16",  # Changed to fp16 instead of bf16
+    "lora_r": 8,
+    "mixed_precision": "fp16",
     "guidance_scale": 7.5,
-    "inference_steps": 50,  # Reduced from 75 to 50
+    "inference_steps": 50,
     "target_modules_preset": "efficient",
     "use_8bit_adam": True,
     "train_text_encoder": False,

@@ -301,8 +301,8 @@ def run_pipeline(
         if not success:
             logger.warning("Evaluation of synthetic images failed, but continuing")
 
-    # Step 6: Visualize training loss
-    logger.info("Step 6: Visualizing training loss")
+    # Step 6: Visualise training loss
+    logger.info("Step 6: Visualising training loss")
     loss_files = []
     for root, dirs, files in os.walk(lora_output_dir):
         for file in files:

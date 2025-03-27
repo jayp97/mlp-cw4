@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 # Configuration
 CONFIG = {
     "specific_class": "df",
-    "num_epochs": 75,  # Increased from 50 to 75 for better learning
+    "num_epochs": 75,
     "num_images": 50,
     "batch_size": 1,
     "gradient_accumulation_steps": 4,
-    "learning_rate": 5e-5,  # Decreased from 1e-4 to 5e-5 for more stable training
+    "learning_rate": 5e-5,
     "output_dir": "results_df_improved",
     "model_id": "runwayml/stable-diffusion-v1-5",
     "seed": 42,

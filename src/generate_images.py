@@ -23,14 +23,14 @@ def generate_images(
     prompt_template="{class_name} skin lesion, dermatology image, high quality, close-up, clinical photograph, detailed skin texture, medical imaging, sharp focus",
     negative_prompt="low quality, blurry, distorted, deformed, unrealistic, cartoon, drawing, painting, watermark, text, signature, border, frame, error, cropped, amateur, pixelated, jpeg artifacts, oversaturated",
     guidance_scale=7.5,
-    num_inference_steps=75,  # Increased from 50 to 75
+    num_inference_steps=75,
     seed=None,
     height=512,
     width=512,
-    scheduler_type="ddim",  # New parameter for scheduler type
-    lora_scale=0.9,  # New parameter for LoRA scale
-    use_test_prompts=False,  # New parameter for testing with different prompts
-    output_format="png",  # New parameter for output format
+    scheduler_type="ddim",
+    lora_scale=0.9,
+    use_test_prompts=False,
+    output_format="png",
 ):
     """
     Generate synthetic skin lesion images using fine-tuned Stable Diffusion.
