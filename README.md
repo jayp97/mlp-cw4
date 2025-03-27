@@ -33,7 +33,7 @@ mlp-cw4/
 This script prepares the HAM10000 dataset for fine-tuning Stable Diffusion:
 
 - It reads the `HAM10000_metadata.csv` to get labels for each image
-- It organizes the processed images (512x512) from your `processed_sd/images` folder
+- It organises the processed images (512x512) from your `processed_sd/images` folder
 - It creates text prompts for each image (e.g., "dermatofibroma skin lesion")
 - It can prepare data for all lesion types or focus on a specific class
 
@@ -53,7 +53,7 @@ This script generates synthetic skin lesion images using the fine-tuned model:
 
 - It loads the base Stable Diffusion model and applies the LoRA weights
 - It generates images based on a prompt template for the specified skin lesion class
-- It allows customization of generation parameters (guidance scale, steps, etc.)
+- It allows customisation of generation parameters (guidance scale, steps, etc.)
 - It saves the generated images to the specified output directory
 
 ### 4. End-to-End Pipeline (`pipeline.py`)
@@ -136,105 +136,7 @@ Key parameters:
 - `--seed`: Random seed for reproducibility
 - `--guidance_scale`: Controls how much the image generation follows the text prompt
 
-## Running on Google Cloud
-
-To run this project on Google Cloud, you can use either Google Colab or a VM instance with a GPU.
-
-### Option 1: Google Colab
-
-1. Upload the scripts to Google Drive
-2. Create a new Colab notebook
-3. Mount your Google Drive:
-   ```python
-   from google.colab import drive
-   drive.mount('/content/drive')
-   ```
-4. Navigate to your project directory:
-   ```
-   %cd /content/drive/MyDrive/path/to/project
-   ```
-5. Install requirements:
-   ```
-   !pip install -r requirements.txt
-   ```
-6. Run the pipeline script:
-   ```
-   !python pipeline.py --specific_class dermatofibroma --num_epochs 50 --num_images 50
-   ```
-
-### Option 2: Google Cloud VM
-
-1. Create a VM instance with GPU:
-
-   - Go to Compute Engine > VM instances
-   - Click "Create instance"
-   - Select a GPU type (e.g., NVIDIA T4 or V100)
-   - Choose a Deep Learning VM Image
-   - Set boot disk size (at least 50GB recommended)
-
-2. SSH into the VM and set up the project:
-
-   ```bash
-   # Clone or upload your code
-   git clone [your-repo-url]
-   cd [your-repo-directory]
-
-   # Install dependencies
-   pip install -r requirements.txt
-   ```
-
-3. Run the pipeline:
-
-   ```bash
-   python pipeline.py --specific_class dermatofibroma --num_epochs 50 --num_images 50
-   ```
-
-4. For large training runs, consider using `screen` or `tmux` to keep the process running even if you disconnect:
-
-   ```bash
-   # Start a new screen session
-   screen -S training
-
-   # Run your training
-   python pipeline.py --specific_class dermatofibroma --num_epochs 100 --num_images 100
-
-   # Detach from screen (training continues): Ctrl+A, then D
-   # Reattach later: screen -r training
-   ```
-
-### Optimizing for Google Cloud
-
-1. **Increase batch size**: If using a powerful GPU like V100 or A100, increase the batch size and adjust learning rate accordingly.
-
-   ```bash
-   python train_lora.py --batch_size 4 --learning_rate 5e-5
-   ```
-
-2. **Use mixed precision**: The default is already fp16, but you can confirm:
-
-   ```bash
-   python train_lora.py --mixed_precision fp16
-   ```
-
-3. **Save storage**: If you're limited on disk space, clean up checkpoints after training:
-
-   ```bash
-   # Keep only the final model
-   find models/lora -type d -name "checkpoint-*" -exec rm -rf {} +
-   find models/lora -type d -name "epoch-*" -exec rm -rf {} +
-   ```
-
-4. **Monitor resources**:
-
-   ```bash
-   # Monitor GPU usage
-   watch -n 1 nvidia-smi
-
-   # Monitor disk space
-   df -h
-   ```
-
-## Customization Tips
+## Customisation Tips
 
 1. **Prompt engineering**: You can modify the prompt template for better results:
 
