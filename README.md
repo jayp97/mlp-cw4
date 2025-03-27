@@ -6,6 +6,32 @@ This repository contains scripts to fine-tune Stable Diffusion for generating sy
 
 ```
 mlp-cw4/
+├── notebooks/
+│   ├── dimensionality-reduction-images/
+│   ├── dimensionality_reduction.ipynb
+│   ├── preprocessing.ipynb
+│   └── results/
+├── scripts/
+│   ├── download_ham10000.py
+│   └── trainval.py
+├── src/
+│   ├── classification.py
+│   ├── create_matching_split.py
+│   ├── create_train_test_split.py
+│   ├── data_preparation.py
+│   ├── data_preprocessing.py
+│   ├── evaluate_images.py
+│   ├── evaluation.py
+│   ├── fine_tune_class.py
+│   ├── generate_class_images.py
+│   ├── generate_images.py
+│   ├── generate_test_images_v1.py
+│   ├── pipeline.py
+│   ├── test_run_df_optimised.py
+│   ├── test_run_df.py
+│   ├── train_classifier.py
+│   ├── train_lora.py
+│   └── visualise_loss.py
 ├── data/
 │   ├── raw/
 │   │   ├── images/                    # Original HAM10000 images (part1 & part2 merged)
@@ -16,14 +42,10 @@ mlp-cw4/
 │   │   └── images/                    # Resized images (512x512)
 │   └── synthetic/
 │       └── images_dermatofibroma/     # Synthetic images generated
-├── data_preparation.py                # Script to prepare data for fine-tuning
-├── train_lora.py                      # Script to fine-tune the model using LoRA
-├── generate_images.py                 # Script to generate synthetic images
-├── pipeline.py                        # Script for full end-to-end pipeline
-├── evaluate_images.py                 # Script for image evaluation
-├── visualise_loss.py                  # Script for visualising training loss
-├── requirements.txt                   # Required packages
-└── README.md                          # Instructions
+├── .gitignore
+├── environment.yml
+├── README.md                          # Instructions
+└── requirements.txt                   # Required packages
 ```
 
 ## Understanding the Code
