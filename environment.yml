@@ -6,17 +6,21 @@ dependencies:
   - python=3.9
   - pytorch
   - torchvision
-  - cudatoolkit=11.3 # Remove or adjust this line if you are on CPU/MPS
+  - cudatoolkit=11.3 # Remove or adjust this if on CPU/MPS
   - pillow # For PIL (image processing)
   - pip # Ensure pip is available
   - pip:
       - kaggle
+      - torch>=2.0
       - peft
       - timm
-      - diffusers
-      - transformers
+      - diffusers[torch]>=0.14 # Ensure diffusers installs with torch compatibility
+      - transformers>=4.25
       - opencv-python
       - numpy
       - pandas
       - tqdm
       - matplotlib
+      - accelerate>=0.16 # Required for LoRA fine-tuning
+      - safetensors # Faster & safer model checkpoint format
+      - pyyaml # Commonly needed for config files
